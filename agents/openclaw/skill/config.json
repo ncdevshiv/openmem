@@ -1,0 +1,14 @@
+{
+  "agent": "OpenClaw",
+  "agent_key": "openclaw",
+  "trigger": "/lm",
+  "context_file": "~/.openclaw/memory_context.md",
+  "workspace_env": "",
+  "auto_memory": true,
+  "auto_learn": true,
+  "learn_interval_hours": 2,
+  "max_search_results": 5,
+  "min_importance_threshold": 0.3,
+  "version": "1.0.0",
+  "generated_at": "2026-04-04T13:01:03.142166"
+}

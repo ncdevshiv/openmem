@@ -1,0 +1,14 @@
+{
+  "agent": "Windsurf",
+  "agent_key": "windsurf",
+  "trigger": "@memory",
+  "context_file": ".windsurf/memory.md",
+  "workspace_env": "WINDSURF_WORKSPACE",
+  "auto_memory": true,
+  "auto_learn": true,
+  "learn_interval_hours": 2,
+  "max_search_results": 5,
+  "min_importance_threshold": 0.3,
+  "version": "1.0.0",
+  "generated_at": "2026-04-04T13:01:03.139656"
+}

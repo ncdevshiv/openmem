@@ -1,0 +1,7 @@
+# OpenMem runtime data (auto-generated)
+data/
+generated_skills/
+*.pid
+__pycache__/
+*.pyc
+.pytest_cache/
