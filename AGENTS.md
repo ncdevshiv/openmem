@@ -1,61 +1,81 @@
 # AGENTS.md - OpenMem Development Guide
 
-Self-learning memory system for AI agents with vector-based semantic search, automatic user profiling, pattern recognition, and skill auto-generation.
+Agent memory system: real session parsing, LanceDB-backed semantic search, tiered consolidation, reflection (LLM or heuristic), an MCP server, and a measured retrieval benchmark.
 
 ## Project Structure
 
 ```
-F:\openmem\
-├── memory_store/           # Core memory systems
-│   ├── vector_db.py        # LanceDB vector store
-│   ├── memory_manager.py   # Memory tier management
-│   ├── user_model.py       # User profiling
-│   └── skill_generator.py  # Skill auto-generation
-├── learning_loop/          # Autonomous learning engine
-│   ├── conversation_indexer.py
+openmem/
+├── main.py                   # Entry point (delegates to bin/launcher.py)
+├── mcp_server.py             # MCP stdio server (remember/recall/context/...)
+├── openmem_cli.py            # Console-script wrapper
+├── memory_store/             # Core memory systems
+│   ├── vector_db.py          # LanceDB vector store (fixed-size vectors,
+│   │                         #   schema migration, keyword fallback search)
+│   ├── memory_manager.py     # Memory tier management (stable sha256 ids)
+│   ├── user_model.py         # User profiling
+│   ├── skill_generator.py    # Skill auto-generation
+│   └── retrieval_metrics.py  # recall@k / MRR / nDCG / fallout (pure)
+├── learning_loop/            # Learning engine
+│   ├── conversation_indexer.py  # Adapter-driven indexing + content dedup
 │   ├── pattern_recognizer.py
-│   ├── reflection_engine.py
-│   └── scheduler.py
-├── autonomous/             # Self-evolution
+│   ├── reflection_engine.py  # Mode-tagged (llm/heuristic), evidence-gated
+│   └── scheduler.py          # 5-phase cycle with per-phase error reporting
+├── autonomous/               # EXPERIMENTAL scaffolds (not wired into cycle)
 │   ├── self_optimizer.py
 │   └── self_evolution.py
-├── skills/                 # OpenClaw integration
-├── bin/                    # Utilities
-└── tests/                  # unittest suite
+├── core/llm.py               # litellm wrapper — lazy, network-free init
+├── agents/                   # Agent contract (base.py) + 11 adapters with
+│                             #   real session parsers (claude_code, codex_cli)
+├── eval/                     # Golden corpus, queries, runner, BASELINE.md
+├── skills/                   # OpenClaw integration + legacy archive
+├── bin/                      # launcher, installer, generators
+├── doc/                      # session_formats.md, mcp_integration.md
+└── tests/                    # 225-test unittest suite (incl. gates)
 ```
 
 ## Build/Lint/Test Commands
 
 ```bash
-# Run quick test suite
-python test_runner.py
-
-# Run all tests in a specific file
-python -m unittest tests/test_memory_store.py
-
-# Run a specific test class
-python -m unittest tests.test_memory_store.TestVectorDB
-
-# Run a single test
-python -m unittest tests.test_memory_store.TestVectorDB.test_add_memory
-
-# Run all tests
+# Run the full suite (must stay green; includes retrieval gate)
 python -m unittest discover -s tests
 
+# Run one file / class / test
+python -m unittest tests.test_memory_store
+python -m unittest tests.test_memory_store.TestVectorDB
+python -m unittest tests.test_memory_store.TestVectorDB.test_add_memory
+
 # Application commands
-python main.py status        # Check system status
-python main.py install       # Install LanceDB binary
-python main.py init          # Initialize database
-python main.py run-cycle     # Run full learning cycle
-python main.py run-cycle --full  # Full re-index
-python main.py search "query" --limit 10  # Search memories
+python main.py status        # System status
+python main.py run-cycle     # Full learning cycle (idempotent)
+python main.py run-cycle --full
+python main.py search "query" --limit 10
+python main.py eval          # Retrieval benchmark -> markdown + data/eval/latest.json
 python main.py profile       # Show user profile
 python main.py stats         # Show statistics
-python main.py daemon start --interval 2   # Run as daemon
 
-# Install dependencies
-pip install -r requirements.txt
+# Install (editable, core only) + extras
+pip install -e .
+pip install -e ".[ml]"   # embeddings/reranker (torch, sentence-transformers)
+pip install -e ".[mcp]"  # MCP server SDK
+pip install -e ".[llm]"  # litellm provider support
 ```
+
+## Development Rules
+
+- **Never let tests touch the live `data/lancedb`** — inject temp paths via the
+  existing DI patterns (`VectorDB(db_path=...)`, engine kwargs). The suite is
+  leakage-checked.
+- **Retrieval gate** — `tests/test_retrieval_gate.py` fails below thresholds in
+  `eval/BASELINE.md`. If you change search behavior, re-run
+  `python main.py eval`, update BASELINE.md deliberately, and note why numbers moved.
+- **Improvements are evidence-gated** — `complete_improvement()` requires
+  `evidence_memory_id` / `evidence_session_id` / `confirmed_by="user"`.
+- **Config** — never commit `config.json` (machine-specific); use
+  `config.example.json` as the template. `OPENMEM_DB_PATH` overrides db_path.
+- **Heavy deps stay optional** — torch/sentence-transformers/transformers live
+  in the `ml` extra; code must degrade gracefully and honestly (no fake data).
+
 
 ## Code Style Guidelines
 
@@ -178,10 +198,11 @@ def cmd_run_cycle(args):
 Use argparse with subparsers, return 0 for success, 1 for failure.
 
 ## Key Dependencies
-- `lancedb>=0.12.0`: Vector database
-- `sentence-transformers>=2.2.0`: Text embeddings
-- `torch>=2.0.0`: ML backend
-- `numpy>=1.24.0`, `pandas>=2.0.0`: Data processing
+
+Core: `lancedb`, `pyarrow`, `numpy`, `python-dateutil`, `tqdm`.
+Extras: `ml` (torch, sentence-transformers, transformers, pandas), `mcp`
+(mcp>=2.0.0), `llm` (litellm), `honcho`. Heavy deps must stay optional —
+every module degrades gracefully without them.
 
 ## Architecture
 
@@ -193,6 +214,9 @@ Use argparse with subparsers, return 0 for success, 1 for failure.
 ### Vector Store
 - LanceDB-backed for sub-millisecond search
 - Auto-embedding via `all-MiniLM-L6-v2`
+- BGE Reranker for improved relevance scoring
+  - GPU: `BAAI/bge-reranker-large` (best quality)
+  - CPU: `BAAI/bge-reranker-base` (good quality, fast)
 - Schema evolution supported
 
 ### Pattern Recognition
@@ -200,8 +224,9 @@ Use argparse with subparsers, return 0 for success, 1 for failure.
 - Response strategies: `concise_direct`, `structured_format`, `code_oriented`
 
 ## File Locations
-- Database: `data/lancedb/`
+- Database: `data/lancedb/` (override with `OPENMEM_DB_PATH`)
 - Memory metadata: `data/memory/memory_meta.db` (SQLite)
-- Patterns: `data/patterns.json`
-- Generated skills: `generated_skills/`
+- Cycle/index state: `data/scheduler_state.json`, `data/sessions/index_state.json`
+- Eval reports: `data/eval/latest.json`; thresholds in `eval/BASELINE.md`
+- Generated skills: `generated_skills/` (gitignored)
 - OpenClaw workspace: `~/.openclaw/workspace`

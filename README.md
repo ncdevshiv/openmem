@@ -1,295 +1,207 @@
-# OpenMem — Agent-Agnostic Autonomous Memory System
+# OpenMem — Agent Memory System for AI Coding Agents
 
-Universal memory layer for **any** AI coding agent. Works with Qwen Code, Claude Code, Cursor, VS Code, OpenClaw, Windsurf, Codex CLI, OpenCode, Antigravity IDE, Kilo CLI, and more.
+Persistent semantic memory for AI coding agents. OpenMem indexes your agents'
+real session history into a local LanceDB vector store, retrieves relevant
+memories on demand, reflects on sessions to extract facts and lessons, and —
+since v2.x — exposes the whole memory layer as a native **MCP server** so any
+MCP-capable client can `remember` / `recall` without file-based integration.
 
-## What It Does
+Works with **Claude Code** and **Codex CLI** session formats today (evidence-based
+parsers), tolerates absent history gracefully elsewhere, and includes a generic
+file-based fallback.
 
-- 🔍 **Semantic Memory Search** — Vector-based embedding search across all conversation history
-- 🧠 **Auto User Profiling** — Learns your preferences, habits, and communication style
-- 📦 **Skill Auto-Generation** — Creates skills from recurring successful patterns
-- 🔄 **Self-Correction Loop** — Reflection engine that evaluates and improves after each session
-- 📅 **Memory Consolidation** — Daily → Weekly → Long-term memory distillation
-- ⚡ **Proactive Learning** — Scheduled cycles that run autonomously
-- 🧬 **Self-Evolution** — Genetic algorithm optimization of response strategies
+> **Status:** actively developed. The storage layer, parsers, learning cycle,
+> MCP server, and evaluation harness are implemented and covered by a 225-test
+> suite. LLM-backed reflection activates automatically when an API key is
+> present; without one everything runs in documented heuristic mode.
+> Retrieval quality is measured, not claimed — see [Evaluation](#evaluation).
 
-## Supported Agents
+## What It Does (verified)
 
-| Agent | Trigger | Context File | Adapter |
-|---|---|---|---|
-| **Qwen Code** | `/mem` | `.qwen/memory_context.md` | ✅ `agents/qwen_code/` |
-| **Claude Code** | `/mem` | `CLAUDE.md` | ✅ `agents/claude_code/` |
-| **Codex CLI** | `/mem` | `.codex/context.md` | ✅ `agents/codex_cli/` |
-| **OpenCode** | `/memory` | `.opencode/context.md` | ✅ `agents/opencode/` |
-| **Antigravity IDE** | `/mem` | `.antigravity/memory.md` | ✅ `agents/antigravity_ide/` |
-| **Kilo CLI** | `/mem` | `.kilo/context.md` | ✅ `agents/kilo_cli/` |
-| **VS Code** | `/mem` | `.vscode/memory.md` | ✅ `agents/vscode/` |
-| **Windsurf** | `@memory` | `.windsurf/memory.md` | ✅ `agents/windsurf/` |
-| **Cursor** | `@memory` | `.cursor/rules/memory.md` | ✅ `agents/cursor/` |
-| **OpenClaw** | `/lm` | `~/.openclaw/memory_context.md` | ✅ `agents/openclaw/` |
-| **Any Agent** | — | file-based sessions | ✅ `agents/generic/` |
+- **Real session parsing** — typed-record JSONL parsers built from on-disk
+  evidence of Claude Code (`~/.claude/projects/**/*.jsonl`) and Codex CLI
+  (`~/.codex/sessions/**/rollout-*.jsonl`), with noise filtering (auth-error
+  spam, CLI echoes, sidechain transcripts) and malformed-line tolerance.
+  Formats are documented in [`doc/session_formats.md`](doc/session_formats.md).
+- **Semantic memory store** — LanceDB with fixed-size vector columns,
+  deterministic IDs, float64 importance scores, automatic schema migration,
+  BGE cross-encoder reranking when the `ml` extra is installed, and an honest
+  keyword-fallback search when it is not.
+- **Tiered memory** — daily → weekly → long-term consolidation with stable,
+  process-independent content hashing; re-runs are idempotent.
+- **Reflection loop** — per-session analysis producing facts, improvements,
+  and memories. Mode-tagged `llm` or `heuristic`; malformed LLM output falls
+  back visibly instead of silently.
+- **Outcome-grounded improvements** — improvement queue items can only be
+  completed with linked evidence (memory id / session id / explicit user
+  confirmation). No self-completion theater.
+- **MCP server** — `remember`, `recall`, `context`, `profile`, `stats`,
+  `forget` tools over stdio; see [`doc/mcp_integration.md`](doc/mcp_integration.md).
+- **Evaluation harness** — golden retrieval benchmark with recall@k / MRR /
+  nDCG@k / fallout metrics and a regression gate wired into the test suite.
+- **11 agent integrations** — skill/context-file installation for Claude Code,
+  Codex CLI, Cursor, VS Code, Windsurf, Qwen Code, OpenCode, Antigravity IDE,
+  Kilo CLI, OpenClaw, plus a generic adapter — all generated from a single
+  template source (`bin/generate_skills.py`) so they cannot drift apart.
 
 ## Quick Start
 
 ```bash
-cd F:\openmem
+git clone https://github.com/ncdevshiv/openmem.git
+cd openmem
 
-# One-command install & setup
-python bin/install.py
+# create an environment and install (core deps only)
+python -m venv .venv && .venv\Scripts\activate     # Windows
+pip install -e .
 
-# Check status
+# initialize the store and check health
 python main.py status
 
-# Run first learning cycle
+# index your real agent history and run one learning cycle
 python main.py run-cycle
 
-# Search memories
-python main.py search "what is my project"
+# search your own memory
+python main.py search "deepseek harness"
+
+# measure retrieval quality (writes data/eval/latest.json)
+python main.py eval
 ```
 
-## Universal Launcher
-
-The `bin/launcher.py` auto-detects which agent you're using and adapts automatically:
+Optional extras:
 
 ```bash
-# Auto-detect agent, show status
-python bin/launcher.py
-
-# Force specific agent
-python bin/launcher.py --agent qwen_code
-python bin/launcher.py --agent cursor
-python bin/launcher.py --agent claude_code
-
-# Install skills for an agent
-python bin/launcher.py --skill cursor
-python bin/launcher.py --skill all
-
-# Run learning cycle
-python bin/launcher.py --run-cycle
-
-# Search memories
-python bin/launcher.py --search python programming
-
-# Start autonomous daemon
-python bin/launcher.py --daemon --interval 2
+pip install -e ".[ml]"    # torch + sentence-transformers + transformers (embeddings & reranker)
+pip install -e ".[mcp]"   # MCP server support (mcp>=2.0.0)
+pip install -e ".[llm]"   # litellm for LLM-backed reflection
 ```
+
+Copy `config.example.json` to `config.json` if you want to override defaults;
+the repo never ships your machine-specific config.
+
+### Enabling AI features
+
+LLM reflection activates automatically when a provider is reachable:
+
+| Provider | Environment variable | Default model |
+|---|---|---|
+| OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` |
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` |
+| Gemini | `GEMINI_API_KEY` | `gemini-pro` |
+| Ollama | `OLLAMA_BASE_URL` | `llama3` |
+
+Without keys, zero network calls are made and reflections are tagged
+`"mode": "heuristic"`. With keys, reflections are tagged `"mode": "llm"` and
+cycle reports include a `reflection_modes` summary. Malformed LLM output is
+rejected and falls back with a visible warning.
+
+## Commands
+
+```
+python main.py status              # system health
+python main.py run-cycle           # full learning cycle (idempotent)
+python main.py run-cycle --full    # re-index from scratch window
+python main.py search <query>      # semantic/keyword memory search
+python main.py eval [--report P]   # retrieval benchmark (markdown + JSON)
+python main.py profile             # learned user profile
+python main.py stats               # store statistics
+python main.py --agents            # list supported adapters
+python main.py --skill <agent>     # install skill files for an agent
+```
+
+## Evaluation
+
+Retrieval quality is measured against a versioned golden set (16 queries over
+a deterministic 36-memory corpus: exact-term, paraphrase, and negative classes)
+with a regression gate wired into the test suite. Baseline (keyword-fallback
+mode, no reranker):
+
+| class      | queries | recall@5 | MRR   | nDCG@5 | fallout@5 |
+|------------|--------:|---------:|------:|-------:|----------:|
+| exact_term | 6       | 0.972    | 1.000 | 1.000  | 0.333     |
+| paraphrase | 6       | 1.000    | 0.889 | 0.917  | 0.300     |
+| negative   | 4       | 0.000    | 0.000 | 0.000  | 0.000     |
+| aggregate  | 16      | 0.740    | 0.708 | 0.719  | 0.237     |
+
+Thresholds and rationale live in [`eval/BASELINE.md`](eval/BASELINE.md); the
+gate fails CI if retrieval regresses below them. Known weaknesses of the
+current keyword matcher (substring false positives like *port* ⊂ *report* /
+*passport*, frequency-rewarding tie-breaks) are logged there as the exact
+targets for the future reranker/embedder work.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Your Agent                                   │
-│  Qwen Code │ Claude Code │ Cursor │ VS Code │ Windsurf │ OpenClaw │ ... │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │
-            ┌──────────────▼──────────────┐
-            │     AgentAdapter Interface   │
-            │  agents/base.py (contract)   │
-            └──┬──┬──┬──┬──┬──┬──┬──┬──┬─┘
-               │  │  │  │  │  │  │  │  │
-  ┌────────────┤  │  │  │  │  │  │  │  ├────────────┐
-  │            │  │  │  │  │  │  │  │  │            │
-  ▼            ▼  ▼  ▼  ▼  ▼  ▼  ▼  ▼            ▼
-agents/    agents/ ...                              agents/
-qwen_code/  claude_code/                            generic/
-  skill/      skill/                                  skill/
-  adapter.py  adapter.py                              adapter.py
-  config.json config.json                             config.json
-                           │
-            ┌──────────────▼──────────────┐
-            │      OpenMem Core           │
-            │  memory_store/               │
-            │  learning_loop/              │
-            │  autonomous/                 │
-            └──────────────┬──────────────┘
-                           │
-            ┌──────────────▼──────────────┐
-            │   bin/ (Fully Portable)      │
-            │  launcher.py                 │
-            │  install.py                  │
-            │  config_generator.py         │
-            │  manifest.json               │
-            └─────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ Your agent          Any MCP-capable client                 │
+│ Claude Code etc.    (remember/recall/context/profile/...)  │
+└───────┬───────────────────────────┬────────────────────────┘
+        │ skill files +             │ stdio (mcp>=2.0)
+        │ context injection         │
+┌───────▼───────────┐      ┌────────▼─────────┐
+│ agents/*          │      │ mcp_server.py    │
+│ real session      │      └────────┬─────────┘
+│ parsers + skills  │               │
+└───────┬───────────┘               ▼
+        ▼                    memory_store (same core)
+┌────────────────────────────────────────────────────────────┐
+│ learning_loop/   scheduler · indexer · patterns · reflect  │
+├────────────────────────────────────────────────────────────┤
+│ memory_store/    vector_db (LanceDB) · tiers · user model  │
+│                  skill generator · retrieval metrics       │
+├────────────────────────────────────────────────────────────┤
+│ core/llm.py      litellm wrapper — lazy, network-free init │
+├────────────────────────────────────────────────────────────┤
+│ eval/            golden corpus · queries · runner · gate   │
+└────────────────────────────────────────────────────────────┘
 ```
 
-## Directory Structure
+Directory map:
 
 ```
-F:\openmem\
-├── main.py                         # Unified entry point
-├── config.json                     # Auto-generated configuration
-├── requirements.txt                # Dependencies
-│
-├── bin/                            # ★ FULLY PORTABLE
-│   ├── launcher.py                 # Universal launcher (auto-detects agent)
-│   ├── install.py                  # One-command installer
-│   ├── config_generator.py         # Generates per-agent config
-│   ├── generate_skills.py          # Generates skill files
-│   ├── manifest.json               # System manifest
-│   ├── portable_env.bat / .sh      # Environment setup scripts
-│   └── run.bat / run.sh            # Entry point scripts
-│
-├── agents/                         # ★ AGENT-AGNOSTIC LAYER
-│   ├── base.py                     # AbstractAdapter interface contract
-│   ├── qwen_code/                  # Qwen Code adapter + skill
-│   ├── claude_code/                # Claude Code adapter + skill
-│   ├── codex_cli/                  # Codex CLI adapter + skill
-│   ├── opencode/                   # OpenCode adapter + skill
-│   ├── antigravity_ide/            # Antigravity IDE adapter + skill
-│   ├── kilo_cli/                   # Kilo CLI adapter + skill
-│   ├── vscode/                     # VS Code adapter + skill
-│   ├── windsurf/                   # Windsurf adapter + skill
-│   ├── cursor/                     # Cursor adapter + skill
-│   ├── openclaw/                   # OpenClaw adapter + skill
-│   └── generic/                    # Fallback for any agent
-│       └── (each has adapter.py, skill/, config.json)
-│
-├── memory_store/                   # Core memory systems
-│   ├── vector_db.py                # LanceDB vector store
-│   ├── memory_manager.py           # Tier management (daily/weekly/longterm)
-│   ├── user_model.py               # Automatic user profiling
-│   └── skill_generator.py          # Pattern → Skill conversion
-│
-├── learning_loop/                  # Autonomous learning engine
-│   ├── scheduler.py                # Orchestrates learning cycles
-│   ├── conversation_indexer.py     # Indexes session transcripts
-│   ├── pattern_recognizer.py       # Statistical pattern detection
-│   └── reflection_engine.py        # Self-correction & improvement
-│
-├── autonomous/                     # Self-evolution
-│   ├── self_optimizer.py           # Performance matrix optimization
-│   └── self_evolution.py           # Genetic algorithm evolution
-│
-├── tests/                          # Test suite
-│   ├── test_memory_store.py
-│   ├── test_learning_loop.py
-│   └── test_integration.py
-│
-└── data/                           # Runtime data (auto-created, gitignored)
-    ├── lancedb/                    # Vector database
-    ├── memory/                     # Tiered memory (daily/weekly/longterm)
-    ├── optimizer/                  # Performance optimization data
-    ├── evolution/                  # Evolution state
-    ├── sessions/                   # Session index state
-    └── usermodel/                  # User profile data
+main.py              entry point (delegates to bin/launcher.py)
+mcp_server.py        MCP stdio server
+openmem_cli.py       console-script wrapper (pip install -e .)
+agents/              adapter contract (base.py) + per-agent parsers/skills
+memory_store/        vector DB, tier manager, user model, skill gen, metrics
+learning_loop/       scheduler, conversation indexer, pattern recognizer,
+                     reflection engine
+autonomous/          EXPERIMENTAL optimizer/evolution scaffolds (not yet
+                     wired into the cycle — see roadmap)
+core/                provider-agnostic LLM abstraction
+eval/                golden corpus, queries, runner, baseline
+bin/                 launcher, installer, config/skill generators
+doc/                 session format inventory, MCP integration guide
+tests/               225-test suite (unit + integration + gates)
 ```
 
-## How Each Agent Integrates
+## Privacy
 
-Every agent adapter follows the same contract:
+Everything is local-first. Indexed content lives in `data/lancedb/`
+(gitignored), the MCP server talks over stdio, and no network call happens
+unless you explicitly configure an LLM provider. Tests run hermetically in
+temp directories and provably never touch the live store.
 
-1. **Read sessions** — Parse the agent's session/conversation files
-2. **Inject context** — Write memory context to the agent's preferred context file
-3. **Install skills** — Copy SKILL.md + learner.py to the agent's skill directory
-4. **Hook messages** — Optional callback for real-time message indexing
-
-### Example: Qwen Code
+## Testing
 
 ```bash
-# Auto-detected when running from a workspace with .qwen/
-python main.py --agent qwen_code
-
-# Installs skill to workspace skills/memory/
-python main.py --skill qwen_code
-
-# Memory context written to .qwen/memory_context.md
-# Sessions read from ~/.qwen/sessions/
+python -m unittest discover -s tests     # 225 tests
 ```
 
-### Example: Cursor
+Includes unit tests for every module, parser fixtures mirroring real on-disk
+formats, MCP end-to-end subprocess tests, LLM boundary mocks, a retrieval
+regression gate, and leakage checks proving the suite leaves the live store
+byte-identical.
 
-```bash
-# Memory context written to .cursor/rules/memory.md (Cursor auto-reads rules/)
-python main.py --skill cursor
+## Roadmap
 
-# Sessions read from .cursor/ or ~/.cursor/sessions/
-```
-
-### Example: Claude Code
-
-```bash
-# Memory context injected into CLAUDE.md in workspace root
-python main.py --skill claude_code
-```
-
-### Generic (Any Agent)
-
-```bash
-# Works with any agent that stores sessions as JSON files
-# Set GENERIC_SESSION_DIR or use workspace .sessions/ directory
-export OPENMEM_AGENT=generic
-python main.py run-cycle
-```
-
-## Configuration
-
-Auto-generated by `bin/config_generator.py`:
-
-```json
-{
-  "agent": "auto-detect",
-  "memory": {
-    "db_path": "data/lancedb",
-    "embedding_model": "all-MiniLM-L6-v2"
-  },
-  "learning": {
-    "auto_learn": true,
-    "interval_hours": 2
-  },
-  "agents": {
-    "qwen_code": { "enabled": true },
-    "claude_code": { "enabled": true },
-    "cursor": { "enabled": true }
-  }
-}
-```
-
-## Portability
-
-Everything is self-contained in this directory:
-
-- ✅ **Windows, Linux, macOS**
-- ✅ **Zero-config defaults** — auto-detects agent, creates data dirs
-- ✅ **Portable env scripts** — `source bin/portable_env.sh` or `bin\portable_env.bat`
-- ✅ **Single entry point** — `python main.py` or `python bin/launcher.py`
-- ✅ **All paths relative** — no hardcoded absolute paths
-
-## Commands
-
-```bash
-# Core
-python main.py install            # Full installation
-python main.py status             # System status
-python main.py run-cycle          # Run learning cycle
-python main.py run-cycle --full   # Full re-index
-
-# Memory
-python main.py search "query"     # Semantic search
-python main.py profile            # User profile
-python main.py stats              # Statistics
-
-# Agent management
-python main.py --agents           # List supported agents
-python main.py --skill cursor     # Install Cursor skill
-python main.py --skill all        # Install all skills
-
-# Daemon
-python main.py daemon             # Start daemon (via launcher)
-```
-
-## For Developers
-
-### Adding a New Agent Adapter
-
-1. Create `agents/my_agent/__init__.py` and `agents/my_agent/adapter.py`
-2. Subclass `AgentAdapter` from `agents/base.py`
-3. Implement the 6 required methods
-4. Create `agents/my_agent/skill/` with `SKILL.md`, `learner.py`, `config.json`
-5. Register: `register_adapter("my_agent", MyAgentAdapter)`
-
-### Adding a New Skill
-
-Skills live in `agents/<name>/skill/`. Edit `SKILL.md` and `learner.py` for agent-specific commands.
+- Reranker/embedder integration for semantic retrieval (levers already
+  identified by the eval: morphology-aware matching, IDF weighting, semantic
+  tie-breaking)
+- Wire `autonomous/` evolution scaffolds to real fitness signals from the
+  eval harness
+- Sleep-time consolidation ("dream cycles") measured by eval lift
+- Cross-agent shared memory namespaces via MCP
 
 ## License
 
-MIT
+[MIT](LICENSE) — © Shivam Tiwari
