@@ -124,6 +124,18 @@ class TestVectorDB(unittest.TestCase):
         self.assertIn("total_user_profiles", stats)
         self.assertGreaterEqual(stats["total_memories"], 2)
     
+    def test_add_memory_explicit_id(self):
+        """Explicit memory_id wins; generated ids stay the default."""
+        explicit = self.db.add_memory(content="Fixture A", memory_id="golden-x-01")
+        auto = self.db.add_memory(content="Fixture B")
+        self.assertEqual(explicit, "golden-x-01")
+        self.assertIsInstance(auto, str)
+        self.assertNotEqual(auto, "golden-x-01")
+
+        row = self.db.get_memory("golden-x-01")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["content"], "Fixture A")
+
     def test_add_memories_batch(self):
         """Test batch memory addition."""
         memories = [
@@ -146,6 +158,10 @@ class TestMemoryManager(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         from memory_store.memory_manager import MemoryManager
         self.manager = MemoryManager(base_path=os.path.join(self.test_dir, "memory"))
+        # Isolation: store_*() mirrors every tier entry into vector_db, which
+        # defaults to the shared live singleton. Redirect it to a temp-backed
+        # store so tier tests never add rows to data/lancedb.
+        self.manager.vector_db = VectorDB(db_path=os.path.join(self.test_dir, "vectordb"))
     
     def tearDown(self):
         """Clean up test fixtures."""
@@ -207,7 +223,8 @@ class TestMemoryManager(unittest.TestCase):
     def test_run_consolidation(self):
         """Test memory consolidation."""
         # Create some daily memories
-        self.manager.store_daily_memory("2026-03-25", "Memory from last week", importance=0.7)
+        # (store_daily_memory has no importance kwarg; importance is fixed at 0.6)
+        self.manager.store_daily_memory("2026-03-25", "Memory from last week")
         
         report = self.manager.run_consolidation(dry_run=False)
         

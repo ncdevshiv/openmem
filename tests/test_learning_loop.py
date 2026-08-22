@@ -159,14 +159,42 @@ class TestPatternRecognizer(unittest.TestCase):
 
 class TestReflectionEngine(unittest.TestCase):
     """Tests for ReflectionEngine."""
-    
+
     def setUp(self):
         """Set up test fixtures."""
         self.test_dir = tempfile.mkdtemp()
         self.engine = ReflectionEngine()
-    
+        # Isolation: ReflectionEngine resolves its JSON paths as instance
+        # attributes, so rebinding them post-init redirects every
+        # _save_reflections/_save_improvements call into the temp dir.
+        # State dicts are reset so nothing leaks in from repo data/, and
+        # the collaborators are repointed at temp-backed instances so
+        # reflection runs never touch data/lancedb or data/memory either.
+        tmp = os.path.join(self.test_dir, "engine_data")
+        os.makedirs(tmp, exist_ok=True)
+        self.engine.reflection_log = os.path.join(tmp, "reflections.json")
+        self.engine.improvements_file = os.path.join(tmp, "improvements.json")
+        self.engine.reflections = {
+            "session_reflections": [],
+            "cross_session_reflections": [],
+            "corrections_made": [],
+            "last_reflection": None,
+        }
+        self.engine.improvements = {"pending": [], "completed": [], "rejected": []}
+        self.engine.vector_db = VectorDB(db_path=os.path.join(tmp, "vectordb"))
+        self.engine.memory_manager = MemoryManager(base_path=os.path.join(tmp, "memory"))
+        self.engine.user_model = UserModel(base_path=os.path.join(tmp, "usermodel"))
+        # UserModel grabs the global vector store in __init__; repoint it at
+        # the isolated store so fact extraction stays hermetic too.
+        self.engine.user_model.vector_db = self.engine.vector_db
+
     def tearDown(self):
         """Clean up test fixtures."""
+        try:
+            self.engine.vector_db.close()
+            self.engine.memory_manager.close()
+        except Exception:
+            pass
         shutil.rmtree(self.test_dir, ignore_errors=True)
     
     def test_extract_facts(self):
@@ -235,17 +263,32 @@ class TestReflectionEngine(unittest.TestCase):
         self.assertEqual(improvement["type"], "knowledge_gap")
     
     def test_complete_improvement(self):
-        """Test completing an improvement."""
+        """Test completing an improvement (evidence now required)."""
         improvement = {
             "type": "test",
             "description": "Test improvement"
         }
-        self.engine.improvements["pending"].append(improvement)
-        
-        self.engine.complete_improvement(improvement)
-        
+        self.engine.improvements["pending"].append(dict(improvement))
+
+        self.engine.complete_improvement(
+            improvement, evidence_memory_id="mem_evidence_123"
+        )
+
+        # complete_improvement stores {**improvement, "completed_at",
+        # evidence...}, i.e. a NEW dict, so identity/equality with the
+        # original can never hold; assert on the matching member instead.
+        completed = [
+            c for c in self.engine.improvements["completed"]
+            if c.get("type") == improvement["type"]
+            and c.get("description") == improvement["description"]
+        ]
+        self.assertEqual(
+            len(completed), 1,
+            "exactly one matching completed improvement expected"
+        )
         self.assertNotIn(improvement, self.engine.improvements["pending"])
-        self.assertIn(improvement, self.engine.improvements["completed"])
+        self.assertIn("completed_at", completed[0])
+        self.assertEqual(completed[0]["evidence_memory_id"], "mem_evidence_123")
 
 
 class TestUserModel(unittest.TestCase):
@@ -254,7 +297,10 @@ class TestUserModel(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.test_dir = tempfile.mkdtemp()
-        self.model = UserModel()
+        # Hermetic profile store: without this, UserModel reads (and would
+        # persist to) the live data/usermodel/ profile, making style tests
+        # depend on whatever previous runs left behind.
+        self.model = UserModel(base_path=os.path.join(self.test_dir, "usermodel"))
     
     def tearDown(self):
         """Clean up test fixtures."""
@@ -280,23 +326,25 @@ class TestUserModel(unittest.TestCase):
     def test_extract_topics(self):
         """Test topic extraction."""
         message = "Can you help me build a Python web app with React frontend?"
-        
+
         topics = self.model._extract_topics(message)
-        
-        self.assertIn("python", topics)
-        self.assertIn("web", topics)
+
+        # _extract_topics returns CATEGORY labels ("coding", "web"), not the
+        # literal keywords ("python", "react") that triggered them.
         self.assertIn("coding", topics)
-    
+        self.assertIn("web", topics)
+
     def test_extract_facts(self):
         """Test fact extraction."""
         messages = [
             "My name is Charlie and I'm working on Project Alpha",
             "I work at TechCorp and I'm based in Mumbai",
         ]
-        
+
         facts = [self.model._extract_facts(m) for m in messages]
-        
-        self.assertEqual(facts[0].get("user_name"), "charlie")
+
+        # _extract_facts capitalizes extracted names deliberately.
+        self.assertEqual(facts[0].get("user_name"), "Charlie")
         self.assertEqual(facts[0].get("current_project"), "alpha")
         self.assertEqual(facts[1].get("company"), "techcorp")
     
@@ -314,12 +362,15 @@ class TestUserModel(unittest.TestCase):
     
     def test_preferred_response_style(self):
         """Test preferred response style generation."""
-        # Set up some profile data
+        # Set up some profile data; emoji_usage must be pinned explicitly
+        # because use_emoji derives solely from it (neutral default is 0.5,
+        # which maps to emojis ON).
         self.model.profile["communication_style"]["formality"] = 0.8
         self.model.profile["communication_style"]["verbosity"] = 0.3
-        
+        self.model.profile["communication_style"]["emoji_usage"] = 0.1
+
         style = self.model.get_preferred_response_style()
-        
+
         self.assertTrue(style["formal"])
         self.assertFalse(style["use_emoji"])
 

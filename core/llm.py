@@ -13,9 +13,12 @@ Usage:
 
 import os
 import json
+import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 OPENMEM_ROOT = Path(__file__).parent.parent
 CONFIG_FILE = OPENMEM_ROOT / "config.json"
@@ -39,6 +42,11 @@ class OpenMemLLM:
         self.config = config or self._load_config()
         self._client = None
         self._available = False
+        # Static, network-free initialization. Availability here means
+        # "configured and plausible" (litellm importable + provider + API
+        # key resolvable); the first real completion is the only time we
+        # ever touch the network. See _init_client.
+        self._litellm = None
         self._init_client()
 
     def _load_config(self) -> Dict:
@@ -51,74 +59,113 @@ class OpenMemLLM:
                 pass
         return {"llm": {"provider": "auto", "model": "auto"}}
 
-    def _init_client(self):
-        """Initialize LLM client."""
+    def _resolve_api_key_env(self) -> Optional[str]:
+        """
+        Resolve which environment variable holds the API key.
+
+        Honors config llm.api_key_env when it names a concrete variable;
+        "AUTO" probes the common provider keys in a fixed order.
+
+        Returns:
+            Environment variable name carrying a key, or None
+        """
         llm_config = self.config.get("llm", {})
-        provider = llm_config.get("provider", "auto").lower()
+        api_key_env = llm_config.get("api_key_env", "AUTO")
+        if api_key_env != "AUTO":
+            return api_key_env if os.environ.get(api_key_env) else None
+
+        for env_var in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                        "GEMINI_API_KEY", "OLLAMA_BASE_URL"]:
+            if os.environ.get(env_var):
+                return env_var
+        return None
+
+    def _init_client(self):
+        """
+        Initialize LLM client configuration — WITHOUT any network I/O.
+
+        The historical implementation fired a live `litellm.completion`
+        probe here, which blocked cycle startup on network timeouts and
+        made import-time behavior environment-dependent. Availability is
+        now a static check:
+
+        - litellm importable?
+        - provider resolved (explicit config or auto-detected from env)?
+        - an API key (or OLLAMA_BASE_URL for local providers) present?
+
+        All three → `_available = True` optimistically; the actual network
+        call happens lazily on first use, and a hard failure there flips
+        availability off so later calls degrade to heuristics without
+        repeated stalls. Anything less → heuristic mode immediately.
+        """
+        llm_config = self.config.get("llm", {})
+        provider = str(llm_config.get("provider", "auto")).lower()
         model = llm_config.get("model", "auto")
 
-        # Check for litellm
         try:
             import litellm
             self._litellm = litellm
-
-            # Set API key from env if not configured
-            api_key_env = llm_config.get("api_key_env", "AUTO")
-            if api_key_env == "AUTO":
-                # Try common env vars
-                for env_var in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]:
-                    if os.environ.get(env_var):
-                        api_key_env = env_var
-                        break
-
-            if api_key_env != "AUTO" and os.environ.get(api_key_env):
-                # Set provider-specific key
-                if "OPENAI" in api_key_env:
-                    litellm.openai_key = os.environ[api_key_env]
-                elif "ANTHROPIC" in api_key_env:
-                    litellm.anthropic_key = os.environ[api_key_env]
-                elif "GEMINI" in api_key_env:
-                    litellm.google_ai_studio_key = os.environ[api_key_env]
-
-            # Auto-detect provider if not set
-            if provider == "auto":
-                if os.environ.get("OPENAI_API_KEY"):
-                    provider = "openai"
-                    if model == "auto":
-                        model = "gpt-4o-mini"
-                elif os.environ.get("ANTHROPIC_API_KEY"):
-                    provider = "anthropic"
-                    if model == "auto":
-                        model = "claude-sonnet-4-20250514"
-                elif os.environ.get("OLLAMA_BASE_URL"):
-                    provider = "ollama"
-                    if model == "auto":
-                        model = "llama3"
-                else:
-                    # No provider configured — use heuristic fallback
-                    self._available = False
-                    return
-
-            # Test the connection
-            try:
-                model_name = f"{provider}/{model}" if provider != "ollama" else f"ollama/{model}"
-                response = litellm.completion(
-                    model=model_name,
-                    messages=[{"role": "user", "content": "Say OK"}],
-                    max_tokens=5,
-                    timeout=10,
-                )
-                self._available = True
-                self._provider = provider
-                self._model = model
-                self._model_name = model_name
-            except Exception:
-                self._available = False
-
         except ImportError:
             # litellm not installed — use heuristic mode
             self._available = False
             self._litellm = None
+            return
+
+        key_env = self._resolve_api_key_env()
+
+        # Auto-detect provider from env evidence if not pinned in config
+        if provider == "auto":
+            if os.environ.get("OPENAI_API_KEY"):
+                provider = "openai"
+                if model == "auto":
+                    model = "gpt-4o-mini"
+            elif os.environ.get("ANTHROPIC_API_KEY"):
+                provider = "anthropic"
+                if model == "auto":
+                    model = "claude-sonnet-4-20250514"
+            elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+                provider = "gemini"
+                if model == "auto":
+                    model = "gemini-pro"
+            elif os.environ.get("OLLAMA_BASE_URL"):
+                provider = "ollama"
+                if model == "auto":
+                    model = "llama3"
+            else:
+                # No provider configured — use heuristic fallback
+                self._available = False
+                return
+
+        # Local providers need no key; hosted ones do. No key = no network,
+        # ever (zero attempts even on first use).
+        needs_key = provider != "ollama"
+        if needs_key and not (key_env and os.environ.get(key_env)):
+            self._available = False
+            return
+
+        if not needs_key and key_env != "OLLAMA_BASE_URL" \
+                and not os.environ.get("OLLAMA_BASE_URL"):
+            self._available = False
+            return
+
+        # Wire a non-standard key variable into litellm (standard variables
+        # are picked up by litellm itself).
+        if key_env and os.environ.get(key_env):
+            key_value = os.environ[key_env]
+            try:
+                if "OPENAI" in key_env:
+                    self._litellm.openai_key = key_value
+                elif "ANTHROPIC" in key_env:
+                    self._litellm.anthropic_key = key_value
+                elif "GEMINI" in key_env or "GOOGLE" in key_env:
+                    self._litellm.google_ai_studio_key = key_value
+            except AttributeError:
+                pass
+
+        self._available = True
+        self._provider = provider
+        self._model = model
+        self._model_name = f"{provider}/{model}"
 
     @property
     def is_available(self) -> bool:
@@ -158,7 +205,12 @@ class OpenMemLLM:
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
-                return f"[LLM Error: {e}]"
+                # First hard failure flips availability off so later calls
+                # degrade to heuristics instead of re-stalling on the wire.
+                logger.warning(f"[LLM] Completion failed ({e}); "
+                               f"disabling LLM backend for this instance")
+                self._available = False
+                return self._heuristic_response(messages)
 
         # Heuristic fallback
         return self._heuristic_response(messages)
@@ -221,6 +273,12 @@ class OpenMemLLM:
         # Heuristic: generate template-based skill
         return self._heuristic_skill(pattern)
 
+    # Keys that mark a reflection payload as usable by the reflection
+    # engine. A parsed JSON object carrying none of them is treated as a
+    # malformed answer, not as an empty-but-valid reflection.
+    _REFLECTION_KEYS = ("outcome", "what_went_well", "what_to_improve",
+                        "facts_to_remember", "knowledge_gaps")
+
     def reflect(self, session_messages: List[Dict]) -> Dict:
         """
         Perform self-reflection on a conversation session.
@@ -229,7 +287,14 @@ class OpenMemLLM:
             session_messages: List of {"role": ..., "content": ...}
 
         Returns:
-            Reflection dict with analysis, improvements, memories
+            Reflection dict with outcome / what_went_well / what_to_improve /
+            facts_to_remember / knowledge_gaps
+
+        Raises:
+            ValueError: If the model returned unparseable JSON or a JSON
+                value without any recognized reflection field. Callers
+                (reflection_engine) treat this as the signal to fall back
+                to heuristic mode with a logged warning.
         """
         if self._available:
             conversation = "\n".join(
@@ -250,13 +315,42 @@ class OpenMemLLM:
                 {"role": "user", "content": f"Reflect on this conversation:\n{conversation}"},
             ], max_tokens=1000, temperature=0.3)
 
-            try:
-                return json.loads(response)
-            except json.JSONDecodeError:
-                return {"raw_reflection": response}
+            return self._parse_reflection_payload(response)
 
         # Heuristic fallback
         return self._heuristic_reflection(session_messages)
+
+    def _parse_reflection_payload(self, response: str) -> Dict:
+        """
+        Parse and shape-validate raw LLM reflection text.
+
+        Args:
+            response: Raw completion text expected to carry JSON
+
+        Returns:
+            Parsed reflection dict
+
+        Raises:
+            ValueError: On invalid JSON or a payload missing every
+                recognized reflection key (includes a response snippet for
+                diagnosability)
+        """
+        try:
+            parsed = json.loads(response)
+        except json.JSONDecodeError as e:
+            snippet = (response or "")[:200]
+            raise ValueError(
+                f"LLM reflection returned invalid JSON ({e}): {snippet!r}"
+            ) from e
+
+        if not isinstance(parsed, dict) or not any(
+                k in parsed for k in self._REFLECTION_KEYS):
+            snippet = (response or "")[:200]
+            raise ValueError(
+                f"LLM reflection JSON lacks recognized keys "
+                f"{list(self._REFLECTION_KEYS)}: {snippet!r}"
+            )
+        return parsed
 
     def extract_facts(self, text: str) -> Dict[str, str]:
         """

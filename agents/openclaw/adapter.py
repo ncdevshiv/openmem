@@ -8,7 +8,7 @@ Context injection: learner.py command interface
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 
 from ..base import AgentAdapter, register_adapter
@@ -20,39 +20,89 @@ class OpenclawAdapter(AgentAdapter):
     AGENT_NAME = "OpenClaw"
     SKILL_FILES = ["SKILL.md", "learner.py", "manifest.json"]
 
-    def __init__(self):
-        self._workspace = os.getcwd()
+    def __init__(self, workspace: str = None):
+        self._workspace = workspace or os.getcwd()
         self._openclaw_dir = os.path.join(os.path.expanduser("~"), ".openclaw")
-        self._session_dir = os.path.join(self._openclaw_dir, "sessions")
-        self._memory_dir = os.path.join(self._workspace, "memory")
-        for d in [self._session_dir, self._memory_dir]:
+        # Session search dirs: workspace sessions first, then the legacy
+        # ~/.openclaw/sessions location. An explicit workspace redirects the
+        # workspace-side paths (used by tests and alternate installs).
+        if workspace:
+            self._session_dirs = [
+                os.path.join(workspace, "sessions"),
+                os.path.join(self._openclaw_dir, "sessions"),
+            ]
+            self._memory_dir = os.path.join(workspace, "memory")
+        else:
+            self._session_dirs = [
+                os.path.join(self._openclaw_dir, "workspace", "sessions"),
+                os.path.join(self._openclaw_dir, "sessions"),
+            ]
+            self._memory_dir = os.path.join(
+                self._openclaw_dir, "workspace", "memory"
+            )
+        for d in self._session_dirs + [self._memory_dir]:
             os.makedirs(d, exist_ok=True)
         self._message_hook = None
 
     def get_session_messages(self, limit: int = 100) -> List[Dict[str, str]]:
         messages = []
-        for session_dir in [self._session_dir, self._memory_dir]:
-            if not os.path.isdir(session_dir):
-                continue
-            for fpath in sorted(
-                self.find_session_files(session_dir, "*.json", hours_back=168),
-                key=lambda f: os.path.getmtime(f), reverse=True
-            ):
-                data = self.load_session_json(fpath)
-                if not data:
-                    continue
-                for msg in data.get("messages", data.get("conversation", [])):
-                    if isinstance(msg, dict) and "content" in msg:
-                        messages.append({
-                            "role": msg.get("role", msg.get("sender", "unknown")),
-                            "content": msg["content"],
-                            "timestamp": msg.get("timestamp", ""),
-                        })
-                if len(messages) >= limit:
-                    break
-            if messages:
+        for session in self.get_recent_sessions(limit=limit):
+            messages.extend(session["messages"])
+            if len(messages) >= limit:
                 break
         return messages[:limit]
+
+    def get_recent_sessions(self, hours_back: int = 168,
+                            limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Enumerate OpenClaw session files into session dicts.
+
+        Returns dicts with "id", "path", "messages" (normalized message
+        dicts incl. session_id) and "data" (raw parsed document, kept for
+        backward compatibility with ConversationIndexer.parse_session_messages).
+        """
+        sessions = []
+        for session_dir in self._session_dirs + [self._memory_dir]:
+            if not os.path.isdir(session_dir):
+                continue
+            for fpath in self.find_session_files(
+                session_dir, "*.json", hours_back=hours_back
+            ):
+                data = self.load_session_json(fpath)
+                if not isinstance(data, dict):
+                    continue
+                msg_list = data.get("messages", data.get("conversation", []))
+                parsed = []
+                for msg in msg_list:
+                    if not isinstance(msg, dict) or "content" not in msg:
+                        continue
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            c.get("text", "") if isinstance(c, dict) else str(c)
+                            for c in content
+                        )
+                    elif not isinstance(content, str):
+                        content = str(content)
+                    content = content.strip()
+                    if not content:
+                        continue
+                    parsed.append({
+                        "role": msg.get("role", msg.get("sender", "unknown")),
+                        "content": content,
+                        "timestamp": msg.get("timestamp",
+                                             msg.get("created_at", "")),
+                        "session_id": data.get("id", Path(fpath).stem),
+                    })
+                sessions.append({
+                    "id": data.get("id", Path(fpath).stem),
+                    "path": fpath,
+                    "data": data,
+                    "messages": parsed,
+                })
+                if len(sessions) >= limit:
+                    return sessions
+        return sessions
 
     def inject_context(self, context: str) -> bool:
         try:
@@ -67,7 +117,7 @@ class OpenclawAdapter(AgentAdapter):
         return os.path.abspath(self._workspace)
 
     def get_session_id(self) -> str:
-        for session_dir in [self._session_dir, self._memory_dir]:
+        for session_dir in self._session_dirs + [self._memory_dir]:
             if os.path.isdir(session_dir):
                 files = self.find_session_files(session_dir, "*.json", hours_back=24)
                 if files:

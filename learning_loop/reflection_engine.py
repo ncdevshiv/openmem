@@ -6,12 +6,15 @@ Self-correction and improvement system that evaluates interactions and updates b
 import os
 import json
 import re
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
 from memory_store import get_vector_db
 from memory_store.memory_manager import MemoryManager
 from memory_store.user_model import UserModel
+
+logger = logging.getLogger(__name__)
 
 
 class ReflectionEngine:
@@ -48,6 +51,14 @@ class ReflectionEngine:
         )
         os.makedirs(os.path.dirname(os.path.abspath(self.improvements_file)), exist_ok=True)
         self.improvements = self._load_improvements()
+
+        # Fallback logging guards: log the reason once per process, not per call
+        self._llm_unavailable_logged = False
+        self._llm_fallback_warned = False
+
+        # Reflection mode accounting for cycle reports ("mode" tags on each
+        # stored reflection roll up here).
+        self.mode_counts: Dict[str, int] = {"llm": 0, "heuristic": 0}
     
     def _load_reflections(self) -> Dict:
         """Load reflection history."""
@@ -111,15 +122,51 @@ class ReflectionEngine:
         # Try LLM-based reflection first
         try:
             from core.llm import get_llm
-            llm = get_llm()
-            if llm.is_available:
-                llm_result = llm.reflect(session_messages)
-                return self._build_reflection_from_llm(reflection, session_messages, llm_result)
-        except (ImportError, Exception):
-            pass
+        except ImportError:
+            # Expected degradation when the optional LLM module is missing
+            if not self._llm_unavailable_logged:
+                self._llm_unavailable_logged = True
+                logger.info("[Reflection] core.llm not available; using heuristic reflection fallback")
+            reflection["mode"] = "heuristic"
+            self.mode_counts["heuristic"] += 1
+            return self._reflect_heuristic(reflection, session_messages)
 
-        # Heuristic fallback (existing logic below)
-        return self._reflect_heuristic(reflection, session_messages)
+        try:
+            llm = get_llm()
+            if not getattr(llm, "is_available", False):
+                # Expected degradation when no LLM backend is configured
+                if not self._llm_unavailable_logged:
+                    self._llm_unavailable_logged = True
+                    logger.info("[Reflection] LLM unavailable; using heuristic reflection fallback")
+                reflection["mode"] = "heuristic"
+                self.mode_counts["heuristic"] += 1
+                return self._reflect_heuristic(reflection, session_messages)
+            llm_result = llm.reflect(session_messages)
+            if not isinstance(llm_result, dict):
+                raise TypeError(
+                    f"LLM reflect() returned {type(llm_result).__name__}, expected dict"
+                )
+            reflection["mode"] = "llm"
+            self.mode_counts["llm"] += 1
+            return self._build_reflection_from_llm(reflection, session_messages, llm_result)
+        except Exception as e:
+            # Never silent: every fallback logs a visible warning (short
+            # message after the first occurrence; full traceback only once
+            # per process to keep cycles readable).
+            if not self._llm_fallback_warned:
+                self._llm_fallback_warned = True
+                logger.warning(
+                    f"[Reflection] LLM reflection failed ({e}); "
+                    f"falling back to heuristic mode"
+                )
+                logger.debug("LLM reflection failure traceback:", exc_info=True)
+            else:
+                logger.warning(f"[Reflection] LLM reflection failed again ({e}); "
+                               f"using heuristic fallback")
+            reflection["mode"] = "heuristic"
+            reflection["mode_fallback_reason"] = str(e)
+            self.mode_counts["heuristic"] += 1
+            return self._reflect_heuristic(reflection, session_messages)
 
     def _build_reflection_from_llm(self, reflection: Dict, session_messages: List[Dict], llm_result: Dict) -> Dict:
         """Build reflection dict from LLM analysis."""
@@ -153,8 +200,13 @@ class ReflectionEngine:
                 "source": "llm_reflection",
             })
 
-        # Facts to remember
-        for key, value in llm_result.get("facts_to_remember", {}).items():
+        # Facts to remember. The LLM prompt asks for a LIST of strings, but
+        # tolerate dict-shaped payloads too; _normalize_facts_to_remember
+        # handles both (the old code called .items() on a list -> AttributeError,
+        # which the broad except silently swallowed into heuristic fallback).
+        for key, value in self._normalize_facts_to_remember(
+            llm_result.get("facts_to_remember")
+        ):
             reflection["memories_to_create"].append({
                 "type": "user_fact",
                 "key": key,
@@ -175,8 +227,61 @@ class ReflectionEngine:
         self.apply_reflection(reflection)
         return reflection
 
+    def _normalize_facts_to_remember(self, raw: Any) -> List[Tuple[str, str]]:
+        """
+        Normalize an LLM 'facts_to_remember' payload into (key, value) pairs.
+
+        The reflect prompt asks for a list of strings, so that is the primary
+        shape; dict payloads ({key: value}) are accepted as-is for robustness.
+
+        Args:
+            raw: List of fact strings, dict of key/value pairs, single string,
+                 or None
+
+        Returns:
+            List of (key, value) string tuples ready for memory storage
+        """
+        pairs: List[Tuple[str, str]] = []
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                key_text = str(key).strip()
+                value_text = str(value).strip()
+                if key_text and value_text:
+                    pairs.append((key_text, value_text))
+        elif isinstance(raw, list):
+            for i, item in enumerate(raw):
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    pairs.append(self._split_fact_text(text, i))
+        elif isinstance(raw, str) and raw.strip():
+            pairs.append(self._split_fact_text(raw.strip(), 0))
+        return pairs
+
+    def _split_fact_text(self, text: str, index: int) -> Tuple[str, str]:
+        """
+        Derive a (key, value) pair from a free-form fact string.
+
+        Heuristic: "key: value" / "key - value" splits on the first separator;
+        anything else is stored as {"fact_<index>": <text>}.
+
+        Args:
+            text: Non-empty fact string
+            index: Position in the source list, used for the fallback key
+
+        Returns:
+            (key, value) tuple of strings
+        """
+        match = re.match(r"^([A-Za-z][A-Za-z0-9 _-]{0,39}?)\s*[:\u2013\u2014-]\s*(.+)$", text)
+        if match:
+            key = match.group(1).strip().lower().replace(" ", "_")
+            return key, match.group(2).strip()
+        return f"fact_{index}", text
+
     def _reflect_heuristic(self, reflection: Dict, session_messages: List[Dict]) -> Dict:
         """Heuristic reflection (original logic, extracted to separate method)."""
+        reflection["mode"] = "heuristic"
         # Separate user and assistant messages
         user_msgs = [m for m in session_messages if m.get("role") == "user"]
         assistant_msgs = [m for m in session_messages if m.get("role") == "assistant"]
@@ -441,15 +546,76 @@ class ReflectionEngine:
         
         return pending[0]
     
-    def complete_improvement(self, improvement: Dict):
-        """Mark an improvement as completed."""
-        if improvement in self.improvements["pending"]:
-            self.improvements["pending"].remove(improvement)
-            self.improvements["completed"].append({
-                **improvement,
-                "completed_at": datetime.now().isoformat()
-            })
-            self._save_improvements()
+    def complete_improvement(
+        self,
+        improvement: Dict,
+        *,
+        evidence_memory_id: Optional[str] = None,
+        evidence_session_id: Optional[str] = None,
+        confirmed_by: Optional[str] = None,
+    ) -> bool:
+        """
+        Mark a pending improvement as completed -- WITH required evidence.
+
+        Phase-3 outcome enforcement: an improvement may only leave
+        "pending" when the completion is grounded in something checkable.
+        At least one of the following must be supplied:
+
+        - evidence_memory_id: id of a memory proving the work happened
+          (e.g. the research memory that resolved a knowledge_gap)
+        - evidence_session_id: session whose transcript proves the outcome
+        - confirmed_by="user": the user explicitly acknowledged completion
+
+        Callers pass exactly what they have; passing none of them raises.
+        Identification paths (apply_reflection) never call this and never
+        fabricate evidence, so items identified by reflection stay pending
+        until real evidence exists.
+
+        Args:
+            improvement: A pending improvement dict (as returned by
+                get_next_improvement())
+            evidence_memory_id: Memory id evidencing completion
+            evidence_session_id: Session id evidencing completion
+            confirmed_by: Must be literally "user" to count as confirmation
+
+        Returns:
+            True if the improvement moved pending -> completed with its
+            evidence recorded; False if the item was not in the pending
+            queue
+
+        Raises:
+            ValueError: If no valid evidence is provided; the item stays
+                pending in that case
+        """
+        has_memory_evidence = isinstance(evidence_memory_id, str) and evidence_memory_id.strip()
+        has_session_evidence = isinstance(evidence_session_id, str) and evidence_session_id.strip()
+        has_user_confirmation = confirmed_by == "user"
+
+        if not (has_memory_evidence or has_session_evidence or has_user_confirmation):
+            raise ValueError(
+                "Refusing to mark improvement completed without evidence: "
+                "pass at least one of evidence_memory_id, "
+                "evidence_session_id, or confirmed_by='user'. The item "
+                "remains pending."
+            )
+
+        if improvement not in self.improvements["pending"]:
+            return False
+
+        self.improvements["pending"].remove(improvement)
+        completed_record = {
+            **improvement,
+            "completed_at": datetime.now().isoformat(),
+        }
+        if has_memory_evidence:
+            completed_record["evidence_memory_id"] = evidence_memory_id.strip()
+        if has_session_evidence:
+            completed_record["evidence_session_id"] = evidence_session_id.strip()
+        if has_user_confirmation:
+            completed_record["confirmed_by"] = "user"
+        self.improvements["completed"].append(completed_record)
+        self._save_improvements()
+        return True
     
     def reject_improvement(self, improvement: Dict, reason: str):
         """Reject an improvement with a reason."""
@@ -473,6 +639,8 @@ class ReflectionEngine:
             "cross_session_reflection_performed": False,
             "improvements_queued": 0,
             "improvements_completed": 0,
+            # How reflections were produced (llm vs heuristic fallback)
+            "reflection_modes": dict(self.mode_counts),
             "stats": {}
         }
         
@@ -482,13 +650,27 @@ class ReflectionEngine:
             report["cross_session_reflection_performed"] = True
             report["cross_session_findings"] = cross_refl.get("patterns_found", [])
         
-        # Process pending improvements
+        # Process pending improvements.
+        #
+        # Phase-3 outcome enforcement (auto-complete bug fix): this used to
+        # apply AND complete the next improvement in the same breath, with
+        # no evidence -- data/improvements.json showed completed items whose
+        # identified_at and completed_at were milliseconds apart. Applying
+        # side effects is honest work, but completion now REQUIRES evidence
+        # via complete_improvement(), so items stay pending here and the
+        # report says exactly that.
         next_imp = self.get_next_improvement()
         if next_imp:
-            # Apply the improvement
             self._apply_improvement(next_imp)
-            self.complete_improvement(next_imp)
-            report["improvements_completed"] = 1
+            report["improvements_applied"] = 1
+            report["improvements_completed"] = 0
+            report["improvements_note"] = (
+                "applied improvement stays pending; completing requires "
+                "evidence via complete_improvement(evidence_memory_id=..., "
+                "evidence_session_id=..., or confirmed_by='user')"
+            )
+        else:
+            report["improvements_applied"] = 0
         
         report["stats"] = self.get_stats()
         report["completed_at"] = datetime.now().isoformat()

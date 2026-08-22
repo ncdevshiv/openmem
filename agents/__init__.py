@@ -11,6 +11,7 @@ from .base import (
     get_adapter,
     get_available_adapters,
     auto_detect_adapter,
+    resolve_agent_adapter,
 )
 
 # Register all adapters on import
@@ -32,4 +33,5 @@ __all__ = [
     "get_adapter",
     "get_available_adapters",
     "auto_detect_adapter",
+    "resolve_agent_adapter",
 ]

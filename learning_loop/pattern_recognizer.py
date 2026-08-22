@@ -14,6 +14,12 @@ import math
 from memory_store import get_vector_db
 from memory_store.memory_manager import MemoryManager
 
+# NOTE(dead code, pending Phase-2 wiring): PatternRecognizer.analyze_conversation_flow()
+# and PatternRecognizer.update_patterns() currently have no production callers
+# (only the test suite invokes them). They remain the sole writers of
+# data/patterns.json and are intentionally kept until Phase-2 wires them into
+# the learning loop.
+
 
 class PatternRecognizer:
     """
@@ -57,6 +63,9 @@ class PatternRecognizer:
         with open(self.patterns_file, 'w') as f:
             json.dump(self.patterns, f, indent=2)
     
+    # NOTE(dead code): no production callers yet — pending Phase-2 wiring
+    # (see module-level note). Kept intentionally; writes nothing to disk here,
+    # but its output feeds update_patterns() below.
     def analyze_conversation_flow(self, messages: List[Dict]) -> Dict:
         """
         Analyze the flow of a conversation to identify patterns.
@@ -211,21 +220,27 @@ class PatternRecognizer:
         
         for memory in recent:
             content = memory.get("content", "")
-            
-            # Classify
-            request_type = self._classify_request(content)
+
+            # Request-type classification applies ONLY to user messages.
+            # Classifying assistant/system memories here inflated request-type
+            # counts (role is stored in metadata by ConversationIndexer).
+            role = memory.get("role") or memory.get("metadata", {}).get("role")
+
+            request_type = None
+            if role == "user":
+                request_type = self._classify_request(content)
+                patterns["request_type_counter"][request_type] += 1
+
             topics = self._extract_topics(content)
-            
-            patterns["request_type_counter"][request_type] += 1
-            
+
             for topic in topics:
                 patterns["topic_counter"][topic] += 1
-                
+
                 # Track transitions
                 if last_topic:
                     patterns["topic_transitions"][(last_topic, topic)] += 1
                 last_topic = topic
-            
+
             # Success indicators
             if any(kw in content.lower() for kw in ["perfect", "thanks", "great"]):
                 if last_request:
@@ -234,8 +249,9 @@ class PatternRecognizer:
                         "topic": topics[0] if topics else "general",
                         "timestamp": memory.get("timestamp")
                     })
-            
-            last_request = request_type
+
+            if request_type:
+                last_request = request_type
         
         # Build pattern results
         results = []
@@ -275,6 +291,8 @@ class PatternRecognizer:
         
         return results
     
+    # NOTE(dead code): no production callers yet — pending Phase-2 wiring
+    # (see module-level note). Sole writer of data/patterns.json.
     def update_patterns(self, conversation_analysis: Dict):
         """Update stored patterns with new conversation analysis."""
         if not conversation_analysis.get("request_types"):

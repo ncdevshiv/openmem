@@ -26,6 +26,16 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# Windows consoles default to a legacy codepage (e.g. cp1252) that cannot
+# encode the emoji/status glyphs used in output. Reconfigure std streams to
+# UTF-8 with replacement so reporting never crashes the CLI.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 # Portable path resolution
 BIN_DIR = Path(__file__).parent
 OPENMEM_ROOT = BIN_DIR.parent
@@ -72,11 +82,28 @@ def get_default_config():
 
 
 def detect_agent():
-    """Auto-detect which agent is calling."""
-    # Check OPENMEM_AGENT env var (highest priority)
-    env_agent = os.environ.get("OPENMEM_AGENT", "").lower().strip()
-    if env_agent and env_agent in SUPPORTED_AGENTS:
-        return env_agent
+    """
+    Auto-detect which agent is calling.
+
+    Delegates to agents.base.resolve_agent_adapter() so the launcher, the
+    learning loop, and every other consumer share ONE detection order
+    (OPENMEM_AGENT env > config.json > on-disk history evidence). The
+    returned adapter's canonical registry key is derived from AGENT_NAME.
+
+    Legacy cwd-indicator sniffing (.claude, .cursor, ...) is kept as a
+    fallback for environments where adapter resolution fails or finds
+    nothing, and "generic" remains the terminal fallback.
+    """
+    try:
+        from agents.base import resolve_agent_adapter
+        adapter = resolve_agent_adapter()
+        name = getattr(adapter, "AGENT_NAME", "") or ""
+        canonical = name.lower().replace(" ", "_")
+        if canonical and canonical != "unknown":
+            return canonical
+    except Exception as e:
+        print(f"[Launcher] Adapter resolution failed ({e}); "
+              f"using legacy detection")
 
     # Check agent-specific env vars
     env_map = {
@@ -189,7 +216,7 @@ def cmd_status(args):
 
 
 def cmd_run_cycle(args):
-    """Run a learning cycle."""
+    """Run a learning cycle. Returns 0 on success, 1 on failure."""
     print("[Launcher] Starting learning cycle...")
     try:
         from learning_loop.scheduler import LearningScheduler
@@ -206,24 +233,30 @@ def cmd_run_cycle(args):
                                    if not isinstance(v, (list, dict)))
                 print(f"  [{phase}] {summary}")
 
+        if report.get("phase_errors"):
+            print(f"  Phase errors: {', '.join(report['phase_errors'].keys())}")
+
         if not report.get("success") and report.get("error"):
             print(f"\n  Error: {report['error']}")
+        return 0 if report.get("success") else 1
     except Exception as e:
         print(f"\n  ❌ Cycle failed: {e}")
         import traceback
         traceback.print_exc()
+        return 1
 
 
 def cmd_search(args):
-    """Search memories."""
-    if not args.query:
-        print("Usage: launcher.py --search <query>")
-        return
+    """Search memories. Returns 0 with hits, 1 on usage error or no matches."""
+    query_terms = getattr(args, "search", None) or getattr(args, "query", None)
+    if not query_terms:
+        print("Usage: main.py search <query>")
+        return 1
 
     try:
         from memory_store.vector_db import get_vector_db
         db = get_vector_db()
-        query = " ".join(args.query)
+        query = " ".join(query_terms)
         results = db.search(query, n_results=args.limit or 10)
 
         print(f"\n  🔍 Search: \"{query}\"")
@@ -231,13 +264,42 @@ def cmd_search(args):
 
         for i, r in enumerate(results, 1):
             content = r.get("content", "")[:150]
+            score = r.get("score") or r.get("similarity")
+            meta_ts = (r.get("metadata") or {}).get("timestamp", "")
             print(f"    {i}. {content}")
             print(f"       [importance: {r.get('importance', 0):.2f}]")
+            if score is not None:
+                print(f"       [score: {float(score):.4f}]")
+            if meta_ts:
+                print(f"       [source timestamp: {meta_ts}]")
             if r.get("tags"):
                 print(f"       tags: {r['tags']}")
             print()
+        return 0 if results else 1
     except Exception as e:
         print(f"  ❌ Search failed: {e}")
+        return 1
+
+
+def cmd_eval(args):
+    """Run the hermetic retrieval-quality evaluation. Returns 0 on success."""
+    try:
+        from eval.run_eval import DEFAULT_REPORT_PATH, render_markdown_report, run_eval
+
+        report_arg = getattr(args, "report", None)
+        report_path = Path(report_arg) if report_arg else DEFAULT_REPORT_PATH
+
+        print(f"[Launcher] Running retrieval eval (report: {report_path})...")
+        report = run_eval(report_path=report_path)
+        print()
+        print(render_markdown_report(report))
+        print(f"\n[Eval] Report written: {report_path}")
+        return 0
+    except Exception as e:
+        print(f"  ❌ Eval failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 def cmd_skill(args):
@@ -394,7 +456,8 @@ Examples:
   python bin/launcher.py --install        # Full installation
   python bin/launcher.py --run-cycle      # Run learning cycle
   python bin/launcher.py --search python  # Search memories
-  python bin/launcher.py --skill cursor   # Install Cursor skill
+  python bin/launcher.py eval             # Run retrieval-quality eval
+  python bin/launcher.py skill cursor     # Install Cursor skill
   python bin/launcher.py --skill all      # Install all skills
   python bin/launcher.py --daemon         # Start daemon
   python bin/launcher.py --agents         # List supported agents
@@ -408,6 +471,7 @@ Examples:
     parser.add_argument("--full", action="store_true", help="Full re-index (with --run-cycle)")
     parser.add_argument("--search", nargs="+", metavar="Q", help="Search memories")
     parser.add_argument("--limit", type=int, default=10, help="Search result limit")
+    parser.add_argument("--report", metavar="PATH", help="Eval report path (with eval command)")
     parser.add_argument("--skill", metavar="AGENT", help="Install skill for agent (or 'all')")
     parser.add_argument("--daemon", action="store_true", help="Start daemon")
     parser.add_argument("--interval", help="Daemon interval (hours)")
@@ -416,7 +480,37 @@ Examples:
     parser.add_argument("--profile", action="store_true", help="Show user profile")
     parser.add_argument("--stats", action="store_true", help="Show statistics")
 
+    # Positional command form (AGENTS.md style): run-cycle, search, eval, status...
+    parser.add_argument(
+        "command", nargs="?", choices=[
+            "install", "status", "run-cycle", "search", "skill", "daemon",
+            "config", "agents", "profile", "stats", "eval",
+        ],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "query_args", nargs="*", help=argparse.SUPPRESS,
+    )
+
     args = parser.parse_args()
+
+    # Normalize positional command into the flag attributes
+    if args.command:
+        if args.command == "run-cycle":
+            args.run_cycle = True
+        elif args.command == "search":
+            if not args.query_args:
+                print("Usage: main.py search <query>")
+                return 1
+            args.search = list(args.query_args)
+        elif args.command in ("install", "status", "config", "agents",
+                              "profile", "stats", "daemon", "eval"):
+            setattr(args, args.command, True)
+        elif args.command == "skill":
+            if not args.query_args:
+                print("Usage: main.py skill <agent|all>")
+                return 1
+            args.skill = args.query_args[0]
 
     # If no args given, show status
     if len(sys.argv) == 1:
@@ -435,13 +529,14 @@ Examples:
         "agents": cmd_agents,
         "profile": cmd_profile,
         "stats": cmd_stats,
+        "eval": cmd_eval,
     }
 
     for arg_name, cmd_fn in commands.items():
         if getattr(args, arg_name, False) or (arg_name == "search" and args.search):
             try:
-                cmd_fn(args)
-                return 0
+                rc = cmd_fn(args)
+                return rc if isinstance(rc, int) else 0
             except Exception as e:
                 print(f"[Launcher] Error: {e}")
                 import traceback

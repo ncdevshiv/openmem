@@ -299,12 +299,12 @@ def execute(context: Dict[str, Any]) -> Dict[str, Any]:
     if relevant_memories:
         response_parts.append("Based on our previous interactions:\\n")
         for mem in relevant_memories[:2]:
-            response_parts.append(f"- {mem['content'][:150]}")
+            response_parts.append(f"- {{mem['content'][:150]}}")
     
     # Get user preferences if available
     if user_model:
         pref_style = user_model.get_preferred_response_style()
-        response_parts.append(f"\\n(Detected style: {'formal' if pref_style.get('formal') else 'casual'})")
+        response_parts.append(f"\\n(Detected style: {{'formal' if pref_style.get('formal') else 'casual'}})")
     
     response = "\\n".join(response_parts) if response_parts else None
     

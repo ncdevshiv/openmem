@@ -29,6 +29,41 @@ import logging
 logging.basicConfig(level=logging.WARNING, format="%(name)s %(levelname)s: %(message)s")
 
 
+def isolated_reflection_engine(test_dir):
+    """
+    Build a ReflectionEngine whose every shared-state store lives in test_dir.
+
+    ReflectionEngine resolves improvements.json/reflections.json as instance
+    attributes and grabs the global vector store plus default-path
+    MemoryManager/UserModel; rebinding them post-init keeps reflection tests
+    from reading or mutating repo data/.
+    """
+    from learning_loop.reflection_engine import ReflectionEngine
+    from memory_store.vector_db import VectorDB
+    from memory_store.memory_manager import MemoryManager
+    from memory_store.user_model import UserModel
+
+    engine = ReflectionEngine()
+    tmp = os.path.join(test_dir, "engine_data")
+    os.makedirs(tmp, exist_ok=True)
+    engine.reflection_log = os.path.join(tmp, "reflections.json")
+    engine.improvements_file = os.path.join(tmp, "improvements.json")
+    engine.reflections = {
+        "session_reflections": [],
+        "cross_session_reflections": [],
+        "corrections_made": [],
+        "last_reflection": None,
+    }
+    engine.improvements = {"pending": [], "completed": [], "rejected": []}
+    engine.vector_db = VectorDB(db_path=os.path.join(tmp, "vectordb"))
+    engine.memory_manager = MemoryManager(base_path=os.path.join(tmp, "memory"))
+    engine.user_model = UserModel(base_path=os.path.join(tmp, "usermodel"))
+    # UserModel grabs the global vector store in __init__; repoint it at the
+    # isolated store so fact extraction stays hermetic too.
+    engine.user_model.vector_db = engine.vector_db
+    return engine
+
+
 # =============================================================================
 # VectorDB Tests — Real LanceDB operations
 # =============================================================================
@@ -133,6 +168,13 @@ class TestMemoryManagerReal(unittest.TestCase):
 
         from memory_store.memory_manager import MemoryManager
         self.manager = MemoryManager(base_path=base_path)
+        # Isolation: store_*() mirrors entries into vector_db, which
+        # defaults to the shared live singleton; bind a temp-backed store
+        # so these tests never write rows into data/lancedb.
+        from memory_store.vector_db import VectorDB
+        self.manager.vector_db = VectorDB(
+            db_path=os.path.join(self.test_dir, "vectordb")
+        )
 
     def tearDown(self):
         self.manager.close()
@@ -210,6 +252,13 @@ class TestUserModelReal(unittest.TestCase):
 
         from memory_store.user_model import UserModel
         self.model = UserModel(base_path=base_path)
+        # Isolation: _save_profile() mirrors the whole profile into
+        # vector_db (set_user_profile upserts); bind a temp-backed store so
+        # analysis tests never touch data/lancedb.
+        from memory_store.vector_db import VectorDB
+        self.model.vector_db = VectorDB(
+            db_path=os.path.join(self.test_dir, "vectordb")
+        )
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -384,14 +433,16 @@ class TestReflectionEngineReal(unittest.TestCase):
             os.makedirs(os.path.join(self.test_dir, sub), exist_ok=True)
         # Override paths via environment
         os.environ["OPENMEM_TEST_DIR"] = self.test_dir
+        # Isolate: the engine ignores OPENMEM_TEST_DIR (paths are module-
+        # relative), so redirect its stores into the temp dir explicitly.
+        self.engine = isolated_reflection_engine(self.test_dir)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_reflect_on_success(self):
         """Real test: reflect on a successful session."""
-        from learning_loop.reflection_engine import ReflectionEngine
-        engine = ReflectionEngine()
+        engine = self.engine
 
         messages = [
             {"role": "user", "content": "Build me a Python script", "session_id": "s1"},
@@ -405,8 +456,7 @@ class TestReflectionEngineReal(unittest.TestCase):
 
     def test_reflect_on_failure(self):
         """Real test: reflect on a failed session."""
-        from learning_loop.reflection_engine import ReflectionEngine
-        engine = ReflectionEngine()
+        engine = self.engine
 
         messages = [
             {"role": "user", "content": "Fix my code", "session_id": "s2"},
@@ -420,8 +470,7 @@ class TestReflectionEngineReal(unittest.TestCase):
 
     def test_reflect_extracts_facts(self):
         """Real test: extract facts during reflection."""
-        from learning_loop.reflection_engine import ReflectionEngine
-        engine = ReflectionEngine()
+        engine = self.engine
 
         messages = [
             {"role": "user", "content": "My name is Bob and I'm building an AI agent", "session_id": "s3"},
@@ -432,8 +481,7 @@ class TestReflectionEngineReal(unittest.TestCase):
 
     def test_improvement_queue(self):
         """Real test: manage improvement queue."""
-        from learning_loop.reflection_engine import ReflectionEngine
-        engine = ReflectionEngine()
+        engine = self.engine
 
         improvement = {
             "type": "knowledge_gap",
@@ -448,11 +496,14 @@ class TestReflectionEngineReal(unittest.TestCase):
         self.assertIsNotNone(next_imp)
         self.assertEqual(next_imp["type"], "knowledge_gap")
 
-        engine.complete_improvement(improvement)
+        engine.complete_improvement(
+            improvement, evidence_session_id="session_evidence_001"
+        )
         # Check by description since complete_improvement adds completed_at
         completed = [i for i in engine.improvements["completed"]
                      if i.get("description") == improvement["description"]]
         self.assertTrue(len(completed) > 0)
+        self.assertEqual(completed[0]["evidence_session_id"], "session_evidence_001")
 
 
 # =============================================================================
@@ -706,6 +757,12 @@ class TestEndToEndReal(unittest.TestCase):
         """Real test: user model learns and persists preferences."""
         from memory_store.user_model import UserModel
         model = UserModel(base_path=os.path.join(self.test_dir, "data", "usermodel"))
+        # Isolation: profile persistence mirrors into vector_db; keep the
+        # writes on a temp-backed store, not data/lancedb.
+        from memory_store.vector_db import VectorDB
+        model.vector_db = VectorDB(
+            db_path=os.path.join(self.test_dir, "data", "lancedb")
+        )
 
         # Analyze multiple messages
         messages = [
@@ -723,8 +780,8 @@ class TestEndToEndReal(unittest.TestCase):
 
     def test_reflection_detects_success_and_failure(self):
         """Real test: reflection engine correctly identifies outcomes."""
-        from learning_loop.reflection_engine import ReflectionEngine
-        engine = ReflectionEngine()
+        # Isolated engine: a bare ReflectionEngine would write repo data/.
+        engine = isolated_reflection_engine(self.test_dir)
 
         # Success case
         success_session = [

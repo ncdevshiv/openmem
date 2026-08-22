@@ -289,9 +289,13 @@ class UserModel:
             r"i am (\w+)",
             r"call me (\w+)"
         ]
+        # Name patterns, ordered most-explicit-first ("my name is X" beats
+        # "i'm X"). First match wins: without this guard the generic
+        # contraction pattern clobbers the explicit one, so "My name is
+        # Charlie and I'm working on ..." extracted user_name="working".
         for pattern in name_patterns:
             match = re.search(pattern, message_lower)
-            if match:
+            if match and "user_name" not in facts:
                 facts["user_name"] = match.group(1).capitalize()
         
         # Project references

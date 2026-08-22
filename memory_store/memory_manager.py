@@ -5,6 +5,8 @@ Handles memory consolidation: daily → weekly → long-term memory distillation
 
 import os
 import json
+import hashlib
+import logging
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -12,6 +14,8 @@ from typing import Dict, List, Any, Optional
 from collections import defaultdict
 
 from . import get_vector_db
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
@@ -72,13 +76,35 @@ class MemoryManager:
         """)
         self.conn.commit()
     
+    @staticmethod
+    def _content_hash(content: str) -> str:
+        """Content digest used for stable ids (matches vector_db.py id style)."""
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    def _row_content(self, memory_id: str) -> Optional[str]:
+        """Return stored content for a memory id, or None if absent."""
+        cursor = self.conn.execute(
+            "SELECT content FROM memory_tiers WHERE id = ?", (memory_id,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
     def store_daily_memory(self, date: str, content: str, source_memories: List[str] = None) -> str:
         """
         Store a daily memory entry.
         date format: YYYY-MM-DD
+
+        The id is a stable content hash, so re-storing identical content is
+        idempotent (no duplicate rows or vector entries).
         """
-        memory_id = f"daily_{date}_{hash(content[:100]) & 0xFFFFFFFF:08x}"
-        
+        memory_id = f"daily_{date}_{self._content_hash(content)}"
+
+        # Skip when an identical entry already exists: keeps re-indexing and
+        # repeated consolidation runs from duplicating vector-store entries.
+        if self._row_content(memory_id) == content:
+            logger.debug(f"[MemoryManager] Daily memory {memory_id} unchanged; skipping re-store")
+            return memory_id
+
         self.conn.execute("""
             INSERT OR REPLACE INTO memory_tiers (id, tier, date_key, content, created_at, source_memories)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -91,7 +117,7 @@ class MemoryManager:
             json.dumps(source_memories or [])
         ))
         self.conn.commit()
-        
+
         # Also add to vector DB
         self.vector_db.add_memory(
             content=content,
@@ -99,13 +125,25 @@ class MemoryManager:
             tags=["daily", date],
             metadata={"tier": "daily", "date": date, "memory_id": memory_id}
         )
-        
+
         return memory_id
-    
+
     def store_weekly_summary(self, week_start: str, content: str, source_daily_keys: List[str] = None) -> str:
-        """Store a weekly summary."""
-        memory_id = f"weekly_{week_start}_{hash(content[:100]) & 0xFFFFFFFF:08x}"
-        
+        """
+        Store a weekly summary.
+
+        The id is a stable content hash, so re-distilling an identical summary
+        is idempotent. source_daily_keys should carry the REAL daily-memory ids
+        the summary was distilled from (used as lineage).
+        """
+        memory_id = f"weekly_{week_start}_{self._content_hash(content)}"
+
+        # Skip when an identical summary already exists: makes consolidation
+        # re-runs non-duplicating in both SQLite and the vector store.
+        if self._row_content(memory_id) == content:
+            logger.debug(f"[MemoryManager] Weekly summary {memory_id} unchanged; skipping re-store")
+            return memory_id
+
         self.conn.execute("""
             INSERT OR REPLACE INTO memory_tiers (id, tier, date_key, content, created_at, source_memories)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -118,7 +156,7 @@ class MemoryManager:
             json.dumps(source_daily_keys or [])
         ))
         self.conn.commit()
-        
+
         # Add to vector DB with higher importance for summaries
         self.vector_db.add_memory(
             content=content,
@@ -126,13 +164,23 @@ class MemoryManager:
             tags=["weekly", week_start],
             metadata={"tier": "weekly", "week": week_start, "memory_id": memory_id}
         )
-        
+
         return memory_id
-    
+
     def store_longterm_memory(self, key: str, content: str, confidence: float = 0.8) -> str:
-        """Store a long-term memory (important distilled fact)."""
+        """
+        Store a long-term memory (important distilled fact).
+
+        Idempotent: storing an unchanged key/content pair again neither
+        rewrites the row nor adds a duplicate vector entry.
+        """
         memory_id = f"longterm_{key}"
-        
+
+        # Skip when an identical entry already exists
+        if self._row_content(memory_id) == content:
+            logger.debug(f"[MemoryManager] Long-term memory {memory_id} unchanged; skipping re-store")
+            return memory_id
+
         self.conn.execute("""
             INSERT OR REPLACE INTO memory_tiers (id, tier, date_key, content, created_at, importance)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -145,7 +193,7 @@ class MemoryManager:
             confidence
         ))
         self.conn.commit()
-        
+
         # Long-term memories get highest importance in vector DB
         self.vector_db.add_memory(
             content=f"{key}: {content}",
@@ -153,7 +201,7 @@ class MemoryManager:
             tags=["longterm", "important", key],
             metadata={"tier": "longterm", "key": key, "memory_id": memory_id}
         )
-        
+
         return memory_id
     
     def get_daily_memories(self, date: str) -> List[Dict]:
@@ -230,10 +278,26 @@ class MemoryManager:
         Consolidate daily memories from a week into a weekly summary.
         Uses LLM-based summarization when available, falls back to heuristic.
         Returns the weekly summary ID.
+
+        Idempotent: if a weekly summary already exists for week_start it is
+        reused untouched. The summary's source_memories lineage carries the
+        REAL ids of the daily memories it was distilled from.
         """
-        # Get all daily memories for this week
+        # Reuse an existing summary for this week instead of re-distilling
+        existing = self.conn.execute(
+            "SELECT id FROM memory_tiers WHERE tier = 'weekly' AND date_key = ?",
+            (week_start,)
+        ).fetchone()
+        if existing:
+            logger.debug(
+                f"[MemoryManager] Weekly summary for {week_start} already exists "
+                f"({existing[0]}); skipping re-distillation"
+            )
+            return existing[0]
+
+        # Get all daily memories for this week, WITH their real ids for lineage
         cursor = self.conn.execute("""
-            SELECT content, importance FROM memory_tiers
+            SELECT id, content, importance FROM memory_tiers
             WHERE tier = 'daily' AND date_key >= ? AND date_key < ?
             ORDER BY importance DESC, created_at DESC
         """, (week_start, self._next_week(week_start)))
@@ -245,29 +309,44 @@ class MemoryManager:
         # Try LLM-based summarization
         try:
             from core.llm import get_llm
-            llm = get_llm()
-            if llm.is_available:
-                combined = "\n".join(f"- {m[0]}" for m in daily_memories[:20])
-                summary = llm.summarize(
-                    f"Week of {week_start} daily memories:\n{combined}",
-                    max_length=500
-                )
-            else:
-                # Heuristic fallback
-                summary = self._heuristic_weekly_summary(week_start, daily_memories)
-        except (ImportError, Exception):
-            # Heuristic fallback
+        except ImportError:
+            # Expected degradation when the optional LLM module is missing
+            logger.info("[MemoryManager] core.llm not available; using heuristic weekly summary")
             summary = self._heuristic_weekly_summary(week_start, daily_memories)
+        else:
+            try:
+                llm = get_llm()
+                if llm.is_available:
+                    combined = "\n".join(f"- {m[1]}" for m in daily_memories[:20])
+                    summary = llm.summarize(
+                        f"Week of {week_start} daily memories:\n{combined}",
+                        max_length=500
+                    )
+                else:
+                    # Heuristic fallback
+                    summary = self._heuristic_weekly_summary(week_start, daily_memories)
+            except Exception as e:
+                # Unexpected failure: log with traceback before falling back
+                logger.exception(
+                    f"[MemoryManager] LLM weekly summarization failed ({e}); using heuristic fallback"
+                )
+                summary = self._heuristic_weekly_summary(week_start, daily_memories)
 
-        daily_keys = [f"daily_{week_start}_{i}" for i in range(len(daily_memories))]
-        return self.store_weekly_summary(week_start, summary, daily_keys)
+        # Lineage: carry the REAL daily-memory ids through (previously these
+        # were fabricated placeholders like daily_{week}_{i})
+        daily_ids = [row[0] for row in daily_memories]
+        return self.store_weekly_summary(week_start, summary, daily_ids)
 
     def _heuristic_weekly_summary(self, week_start: str, daily_memories: list) -> str:
-        """Create weekly summary without LLM."""
-        high_priority = [m[0] for m in daily_memories if m[1] >= 0.6]
+        """Create weekly summary without LLM.
+
+        Rows are (id, content, importance) tuples as selected by
+        distill_daily_to_weekly.
+        """
+        high_priority = [m[1] for m in daily_memories if m[2] >= 0.6]
         if high_priority:
             return f"Week of {week_start}: " + "; ".join(high_priority[:5])
-        return f"Week of {week_start}: " + "; ".join([m[0] for m in daily_memories[:3]])
+        return f"Week of {week_start}: " + "; ".join([m[1] for m in daily_memories[:3]])
     
     def distill_weekly_to_longterm(self, weeks_back: int = 4) -> List[str]:
         """
@@ -285,6 +364,9 @@ class MemoryManager:
             if any(kw in content.lower() for kw in ["preference", "always", "never", "important", "remember"]):
                 # Extract as long-term
                 key = f"from_week_{summary['week_start']}"
+                # Skip (and don't report as created) when already distilled
+                if self._row_content(f"longterm_{key}") == content:
+                    continue
                 self.store_longterm_memory(key, content, confidence=0.7)
                 created.append(key)
         
@@ -343,10 +425,22 @@ class MemoryManager:
         prev_week_start = (datetime.strptime(most_recent_sunday, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
         
         if not dry_run:
-            weekly_id = self.distill_daily_to_weekly(prev_week_start)
-            if weekly_id:
-                report["weekly_created"] += 1
-                report["actions"].append(f"Created weekly summary: {weekly_id}")
+            # Report honestly: only count a weekly summary we actually created;
+            # an already-distilled week is logged as reused, not created.
+            existing_weekly = self.conn.execute(
+                "SELECT id FROM memory_tiers WHERE tier = 'weekly' AND date_key = ?",
+                (prev_week_start,)
+            ).fetchone()
+            if existing_weekly:
+                logger.info(
+                    f"[MemoryManager] Weekly summary for {prev_week_start} already "
+                    f"present ({existing_weekly[0]}); skipping re-distillation"
+                )
+            else:
+                weekly_id = self.distill_daily_to_weekly(prev_week_start)
+                if weekly_id:
+                    report["weekly_created"] += 1
+                    report["actions"].append(f"Created weekly summary: {weekly_id}")
         
         # Extract long-term from recent weeks
         longterm_keys = self.distill_weekly_to_longterm(weeks_back=4)

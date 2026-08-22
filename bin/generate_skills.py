@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Generate skill files for all agent adapters."""
+"""Generate skill files for all agent adapters.
+
+Regeneration contract: every file under agents/<agent>/skill/ is generated
+output of this module. Never edit those artifacts by hand — change the
+templates here and re-run ``python bin/generate_skills.py``. Output is
+byte-deterministic (no timestamps, explicit CRLF) so that committed files
+always equal generator output; tests/test_skill_consistency.py enforces it.
+"""
 
 import os
 import json
-from datetime import datetime
+import sys
 
 AGENTS = {
     "qwen_code": {
@@ -65,6 +72,19 @@ AGENTS = {
         "trigger": "/lm",
         "context_file": "~/.openclaw/memory_context.md",
         "workspace_env": "",
+    },
+    # Fallback adapter (agents/generic/adapter.py): sessions come from
+    # GENERIC_SESSION_DIR or <workspace>/.sessions/; when neither exists the
+    # adapter creates <workspace>/.openmem/sessions/ and inject_context()
+    # writes _memory_context.txt into that session dir — hence context_file.
+    # GENERIC_SESSION_DIR is the documented env hook (README.md "Generic").
+    # base.auto_detect_adapter() falls back to Generic, and base.install_skill
+    # derives this dir name from AGENT_NAME "Generic" -> agents/generic/skill.
+    "generic": {
+        "display": "Any Agent",
+        "trigger": "/mem",
+        "context_file": ".openmem/sessions/_memory_context.txt",
+        "workspace_env": "GENERIC_SESSION_DIR",
     },
 }
 
@@ -426,6 +446,9 @@ if __name__ == "__main__":
 
 
 def make_config_json(agent_key, agent_info):
+    # No "generated_at" timestamp: artifacts must be byte-reproducible so the
+    # committed files always equal this module's output. Nothing consumes
+    # skill-level config.json keys at runtime (adapters only copy these files).
     return {
         "agent": agent_info["display"],
         "agent_key": agent_key,
@@ -438,31 +461,66 @@ def make_config_json(agent_key, agent_info):
         "max_search_results": 5,
         "min_importance_threshold": 0.3,
         "version": "1.0.0",
-        "generated_at": datetime.now().isoformat(),
+    }
+
+
+# The three artifacts every agent's skill directory must contain.
+ARTIFACT_FILENAMES = ("SKILL.md", "learner.py", "config.json")
+
+
+def build_artifacts(agent_key):
+    """Build raw artifact contents for one registered agent.
+
+    Args:
+        agent_key: Key into AGENTS (e.g. "qwen_code", "generic")
+
+    Returns:
+        Dict mapping artifact filename to its content string (LF line endings)
+    """
+    info = AGENTS[agent_key]
+    return {
+        "SKILL.md": make_skill_md(agent_key, info),
+        "learner.py": make_learner_py(agent_key, info),
+        "config.json": json.dumps(make_config_json(agent_key, info), indent=2),
+    }
+
+
+def render_bytes(agent_key):
+    """Serialize an agent's artifacts to the exact bytes written on disk.
+
+    Line endings are normalized to CRLF explicitly so output is identical
+    regardless of the platform the generator runs on.
+
+    Args:
+        agent_key: Key into AGENTS
+
+    Returns:
+        Dict mapping artifact filename to UTF-8 encoded file bytes
+    """
+    return {
+        name: content.replace("\n", "\r\n").encode("utf-8")
+        for name, content in build_artifacts(agent_key).items()
     }
 
 
 def main():
+    # Status lines contain non-ASCII glyphs; keep them from crashing under
+    # legacy Windows console codepages (cp1252/cp437) when stdout is piped.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     for agent_key, agent_info in AGENTS.items():
         skill_dir = os.path.join(base, "agents", agent_key, "skill")
         os.makedirs(skill_dir, exist_ok=True)
 
-        # SKILL.md
-        skill_md = make_skill_md(agent_key, agent_info)
-        with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as f:
-            f.write(skill_md)
-
-        # learner.py
-        learner = make_learner_py(agent_key, agent_info)
-        with open(os.path.join(skill_dir, "learner.py"), "w", encoding="utf-8") as f:
-            f.write(learner)
-
-        # config.json
-        config = make_config_json(agent_key, agent_info)
-        with open(os.path.join(skill_dir, "config.json"), "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
+        artifacts = render_bytes(agent_key)
+        for fname in ARTIFACT_FILENAMES:
+            with open(os.path.join(skill_dir, fname), "wb") as f:
+                f.write(artifacts[fname])
 
         print(f"✅ Generated skills for {agent_info['display']}")
 

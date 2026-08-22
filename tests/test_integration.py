@@ -59,9 +59,13 @@ class TestFullLearningCycle(unittest.TestCase):
     def test_memory_manager_integration(self):
         """Test memory manager integrates with vector DB."""
         from memory_store.memory_manager import MemoryManager
-        
+        from memory_store.vector_db import VectorDB
+
         mem_path = os.path.join(self.test_dir, "test_memory")
         manager = MemoryManager(base_path=mem_path)
+        # Isolation: store_daily_memory mirrors into vector_db; bind the
+        # temp store so this integration test never writes to data/lancedb.
+        manager.vector_db = VectorDB(db_path=os.path.join(self.test_dir, "mgr_vectordb"))
         
         # Store daily memory
         today = datetime.now().strftime("%Y-%m-%d")
@@ -77,8 +81,11 @@ class TestFullLearningCycle(unittest.TestCase):
     def test_user_model_integration(self):
         """Test user model integrates with vector DB."""
         from memory_store.user_model import UserModel
-        
-        model = UserModel()
+        from memory_store.vector_db import VectorDB
+
+        # Hermetic stores: keep analysis/profile persistence out of repo data/.
+        model = UserModel(base_path=os.path.join(self.test_dir, "usermodel"))
+        model.vector_db = VectorDB(db_path=os.path.join(self.test_dir, "usermodel_vectordb"))
         
         # Analyze a message
         analysis = model.analyze_message(
@@ -109,6 +116,10 @@ class TestFullLearningCycle(unittest.TestCase):
             )
         
         recognizer = PatternRecognizer()
+        # find_recurring_patterns reads self.vector_db (the global singleton);
+        # bind it to the seeded throwaway store so the test is hermetic and
+        # the assertion reflects the memories added above.
+        recognizer.vector_db = db
         patterns = recognizer.find_recurring_patterns(days_back=1)
         
         # Should find Python as a pattern
@@ -119,8 +130,28 @@ class TestFullLearningCycle(unittest.TestCase):
     def test_reflection_engine_integration(self):
         """Test reflection engine with session data."""
         from learning_loop.reflection_engine import ReflectionEngine
-        
+        from memory_store.vector_db import VectorDB
+        from memory_store.memory_manager import MemoryManager
+        from memory_store.user_model import UserModel
+
         engine = ReflectionEngine()
+        # Isolation: redirect the engine's shared-state stores into the temp
+        # dir so this test neither reads nor mutates repo data/.
+        tmp = os.path.join(self.test_dir, "engine_data")
+        os.makedirs(tmp, exist_ok=True)
+        engine.reflection_log = os.path.join(tmp, "reflections.json")
+        engine.improvements_file = os.path.join(tmp, "improvements.json")
+        engine.reflections = {
+            "session_reflections": [],
+            "cross_session_reflections": [],
+            "corrections_made": [],
+            "last_reflection": None,
+        }
+        engine.improvements = {"pending": [], "completed": [], "rejected": []}
+        engine.vector_db = VectorDB(db_path=os.path.join(tmp, "vectordb"))
+        engine.memory_manager = MemoryManager(base_path=os.path.join(tmp, "memory"))
+        engine.user_model = UserModel(base_path=os.path.join(tmp, "usermodel"))
+        engine.user_model.vector_db = engine.vector_db
         
         # Simulate a conversation
         messages = [
@@ -261,19 +292,20 @@ class TestMemoryTiers(unittest.TestCase):
     def test_daily_to_weekly_consolidation(self):
         """Test consolidating daily memories to weekly."""
         from memory_store.memory_manager import MemoryManager
-        
+        from memory_store.vector_db import VectorDB
+
         mem_path = os.path.join(self.test_dir, "memory")
         manager = MemoryManager(base_path=mem_path)
+        # Isolation: consolidation mirrors tier entries into vector_db;
+        # bind a temp store so this test never writes to data/lancedb.
+        manager.vector_db = VectorDB(db_path=os.path.join(self.test_dir, "tiers_vectordb"))
         
         # Store multiple daily memories
+        # (store_daily_memory has no importance kwarg; tier importance is fixed)
         for day_offset in range(7):
             from datetime import timedelta
             date = (datetime.now() - timedelta(days=day_offset)).strftime("%Y-%m-%d")
-            manager.store_daily_memory(
-                date,
-                f"Memory from {date}",
-                importance=0.6 if day_offset % 2 == 0 else 0.4
-            )
+            manager.store_daily_memory(date, f"Memory from {date}")
         
         # Run consolidation
         # Week should be auto-determined from current date
