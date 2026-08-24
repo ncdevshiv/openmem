@@ -336,16 +336,19 @@ def _install_single_skill(agent_name):
 def cmd_agents(args):
     """List supported agents."""
     print("\n  Supported Agents:\n")
+    detected = detect_agent()
     for i, agent in enumerate(SUPPORTED_AGENTS, 1):
         try:
             from agents.base import get_adapter
             adapter = get_adapter(agent)
             name = adapter.get_agent_name() if adapter else agent
+            parses = getattr(adapter, "PARSES_LIVE_SESSIONS", True)
         except Exception:
-            name = agent
+            name, parses = agent, False
 
-        indicator = " ← DETECTED" if detect_agent() == agent else ""
-        print(f"    {i}. {name} ({agent}){indicator}")
+        indicator = " ← DETECTED" if detected == agent else ""
+        note = "" if parses else " · no evidenced session format yet"
+        print(f"    {i}. {name} ({agent}){note}{indicator}")
     print()
 
 

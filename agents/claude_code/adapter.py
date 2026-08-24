@@ -17,11 +17,14 @@ Context injection: CLAUDE.md system prompt file
 
 import os
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 
 from ..base import AgentAdapter, register_adapter
+
+logger = logging.getLogger(__name__)
 
 
 # User records that are CLI command echoes / injected caveats, not conversation.
@@ -133,9 +136,10 @@ class ClaudeCodeAdapter(AgentAdapter):
                 break
 
         if files_read or malformed_total:
-            print(
-                f"[Claude Code] Parsed {len(messages)} messages from "
-                f"{files_read} session file(s), skipped {malformed_total} malformed line(s)"
+            logger.info(
+                "[Claude Code] Parsed %d messages from %d session file(s), "
+                "skipped %d malformed line(s)",
+                len(messages), files_read, malformed_total,
             )
         return messages[:limit]
 

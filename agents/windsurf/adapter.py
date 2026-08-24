@@ -1,7 +1,11 @@
 """
 OpenMem — Windsurf Adapter (Codeium Windsurf IDE).
 
-Session storage: ~/.windsurf/sessions/
+No evidenced Windsurf session format yet (doc/session_formats.md): nothing
+writes ~/.windsurf/sessions/ in real installs. PARSES_LIVE_SESSIONS is
+False until a real format is inventoried.
+
+Session storage: ~/.windsurf/sessions/ (unverified)
 Skill install: ~/.windsurf/skills/ or workspace .windsurf/
 Context injection: .windsurf/memory.md
 """
@@ -19,12 +23,13 @@ class WindsurfAdapter(AgentAdapter):
 
     AGENT_NAME = "Windsurf"
     SKILL_FILES = ["SKILL.md", "learner.py"]
+    # Format unevidenced — see module docstring / doc/session_formats.md.
+    PARSES_LIVE_SESSIONS = False
 
     def __init__(self):
         self._workspace = os.environ.get("WINDSURF_WORKSPACE", os.getcwd())
         self._windsurf_dir = os.path.join(os.path.expanduser("~"), ".windsurf")
         self._session_dir = os.path.join(self._windsurf_dir, "sessions")
-        os.makedirs(self._session_dir, exist_ok=True)
         self._message_hook = None
 
     def get_session_messages(self, limit: int = 100) -> List[Dict[str, str]]:

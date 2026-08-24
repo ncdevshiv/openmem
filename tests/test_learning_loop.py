@@ -347,6 +347,17 @@ class TestUserModel(unittest.TestCase):
         self.assertEqual(facts[0].get("user_name"), "Charlie")
         self.assertEqual(facts[0].get("current_project"), "alpha")
         self.assertEqual(facts[1].get("company"), "techcorp")
+
+    def test_extract_facts_does_not_capture_possessive_team(self):
+        """The removed r"(\\w+) team" pattern stored company="my" here."""
+        facts = self.model._extract_facts("my team is migrating the pipeline")
+        self.assertNotIn("company", facts)
+
+    def test_extract_facts_at_company_takes_org_name(self):
+        """"at X company" must capture the org, not the literal word
+        "company" (the old group(2) selection did)."""
+        facts = self.model._extract_facts("we ship it at acme company now")
+        self.assertEqual(facts.get("company"), "acme")
     
     def test_detect_sentiment_positive(self):
         """Test positive sentiment detection."""

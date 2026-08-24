@@ -17,11 +17,14 @@ Context injection: .codex/context.md
 """
 
 import os
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 
 from ..base import AgentAdapter, register_adapter
+
+logger = logging.getLogger(__name__)
 
 
 # Codex harness injects machine context as user-role messages wrapped in XML.
@@ -123,9 +126,10 @@ class CodexCliAdapter(AgentAdapter):
                 break
 
         if files_read or malformed_total:
-            print(
-                f"[Codex CLI] Parsed {len(messages)} messages from "
-                f"{files_read} rollout file(s), skipped {malformed_total} malformed line(s)"
+            logger.info(
+                "[Codex CLI] Parsed %d messages from %d rollout file(s), "
+                "skipped %d malformed line(s)",
+                len(messages), files_read, malformed_total,
             )
         return messages[:limit]
 

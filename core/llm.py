@@ -413,11 +413,12 @@ class OpenMemLLM:
             ], max_tokens=500, temperature=0.3)
 
             try:
-                return json.loads(response)
+                parsed = json.loads(response)
             except json.JSONDecodeError:
-                return {}
+                return self._heuristic_profile(messages)
+            return parsed if isinstance(parsed, dict) else {}
 
-        return {}
+        return self._heuristic_profile(messages)
 
     # ------------------------------------------------------------------
     # Heuristic Fallbacks (when no LLM is configured)
@@ -515,6 +516,58 @@ def execute(context):
                 facts[key] = match.group(1)
 
         return facts
+
+    def _heuristic_profile(self, messages: List[Dict]) -> Dict:
+        """
+        Profile communication style without an LLM.
+
+        Produces the same schema the profile_user LLM prompt requests so
+        consumers (user_model) can treat both paths identically. Topics are
+        deliberately left empty: user_model runs its own keyword topic
+        extraction in heuristic mode and would double-count raw word
+        frequencies.
+        """
+        texts = [m.get("content", "") for m in messages if m.get("role") == "user"]
+        if not texts:
+            return {}
+
+        joined = "\n".join(texts)
+        lower = joined.lower()
+
+        formal = sum(lower.count(k) for k in ("please", "thank you",
+                                              "could you", "would you", "kindly"))
+        casual = sum(lower.count(k) for k in ("lol", "haha", "gonna", "wanna", "pls"))
+        emojis = sum(1 for ch in joined if ord(ch) >= 0x1F300)
+
+        formality = max(0.0, min(1.0, 0.5 + 0.15 * (formal - casual)))
+
+        avg_words = len(lower.split()) / len(texts)
+        verbosity = max(0.0, min(1.0, avg_words / 80))
+
+        structured = any(m in joined for m in ("- ", "* ", "1. ", "```"))
+        if structured:
+            preferred = "structured"
+        elif avg_words < 15:
+            preferred = "concise"
+        else:
+            preferred = "detailed"
+
+        tips = []
+        if casual:
+            tips.append("Casual tone detected — mirroring informality usually lands well")
+        if emojis:
+            tips.append("Emoji-tolerant communication")
+        if not tips:
+            tips.append("No strong style signals detected")
+
+        return {
+            "formality": round(formality, 2),
+            "verbosity": round(verbosity, 2),
+            "emoji_usage": round(min(1.0, emojis / len(texts)), 2),
+            "preferred_response": preferred,
+            "topics_of_interest": [],
+            "communication_tips": tips,
+        }
 
     def get_status(self) -> Dict:
         """Get LLM status."""

@@ -19,11 +19,14 @@ Context injection: .cursor/rules/memory.md (Cursor reads rules dir)
 
 import os
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 
 from ..base import AgentAdapter, register_adapter
+
+logger = logging.getLogger(__name__)
 
 
 class CursorAdapter(AgentAdapter):
@@ -125,9 +128,10 @@ class CursorAdapter(AgentAdapter):
                 break
 
         if seen_any_file:
-            print(
-                f"[Cursor] Parsed {len(messages)} messages from "
-                f"~/.cursor/sessions and workspace .cursor/sessions"
+            logger.info(
+                "[Cursor] Parsed %d messages from "
+                "~/.cursor/sessions and workspace .cursor/sessions",
+                len(messages),
             )
         return messages[:limit]
 

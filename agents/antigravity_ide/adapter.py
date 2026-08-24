@@ -1,7 +1,12 @@
 """
 OpenMem — Antigravity IDE Adapter.
 
+No evidenced Antigravity IDE session format yet (doc/session_formats.md):
+nothing writes ~/.antigravity/sessions/ in real installs.
+PARSES_LIVE_SESSIONS is False until a real format is inventoried.
+
 Session storage: IDE-managed workspace, accessed via IDE API or local cache
+(unverified)
 Skill install: IDE extensions/plugins directory
 Context injection: IDE virtual document or workspace settings
 """
@@ -19,12 +24,13 @@ class AntigravityIdeAdapter(AgentAdapter):
 
     AGENT_NAME = "Antigravity IDE"
     SKILL_FILES = ["SKILL.md", "learner.py"]
+    # Format unevidenced — see module docstring / doc/session_formats.md.
+    PARSES_LIVE_SESSIONS = False
 
     def __init__(self):
         self._workspace = os.environ.get("ANTIGRAVITY_WORKSPACE", os.getcwd())
         self._ide_dir = os.path.join(os.path.expanduser("~"), ".antigravity")
         self._session_dir = os.path.join(self._ide_dir, "sessions")
-        os.makedirs(self._session_dir, exist_ok=True)
         self._message_hook = None
 
     def get_session_messages(self, limit: int = 100) -> List[Dict[str, str]]:
