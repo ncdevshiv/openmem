@@ -1,7 +1,11 @@
 """
 OpenMem — Kilo CLI Adapter.
 
-Session storage: ~/.kilo/sessions/
+No evidenced Kilo CLI session format yet (doc/session_formats.md): nothing
+writes ~/.kilo/sessions/ in real installs. PARSES_LIVE_SESSIONS is False
+until a real format is inventoried.
+
+Session storage: ~/.kilo/sessions/ (unverified)
 Skill install: ~/.kilo/skills/
 Context injection: .kilo/context.md
 """
@@ -19,12 +23,13 @@ class KiloCliAdapter(AgentAdapter):
 
     AGENT_NAME = "Kilo CLI"
     SKILL_FILES = ["SKILL.md", "learner.py"]
+    # Format unevidenced — see module docstring / doc/session_formats.md.
+    PARSES_LIVE_SESSIONS = False
 
     def __init__(self):
         self._workspace = os.getcwd()
         self._kilo_dir = os.path.join(os.path.expanduser("~"), ".kilo")
         self._session_dir = os.path.join(self._kilo_dir, "sessions")
-        os.makedirs(self._session_dir, exist_ok=True)
         self._message_hook = None
 
     def get_session_messages(self, limit: int = 100) -> List[Dict[str, str]]:

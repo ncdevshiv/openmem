@@ -309,16 +309,20 @@ class UserModel:
             if match:
                 facts["current_project"] = match.group(1)
         
-        # Company/org
+        # Company/org. Every pattern carries exactly one capture group so
+        # the loop below can always take group(1): the old
+        # r"at (\w+) (company|firm|lab)" selected group(2) and stored the
+        # literal word "company". The bare r"(\w+) team" pattern was removed
+        # rather than patched with stopword lists — unanchored, it matched
+        # possessives ("my team" -> company="my") and generic nouns.
         company_patterns = [
-            r"at (\w+) (company|firm|lab)",
-            r"i work (at|for) (\w+)",
-            r"(\w+) team"
+            r"at (\w+) (?:company|firm|lab)",
+            r"i work (?:at|for) (\w+)",
         ]
         for pattern in company_patterns:
             match = re.search(pattern, message_lower)
             if match:
-                facts["company"] = match.group(2) if len(match.groups()) > 1 else match.group(1)
+                facts["company"] = match.group(1)
         
         # Location
         location_patterns = [

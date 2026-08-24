@@ -111,6 +111,11 @@ General parsing contract for all adapters:
 ## Other adapters
 
 `qwen_code`, `opencode`, `antigravity_ide`, `kilo_cli`, `vscode`,
-`windsurf`, `generic`: no local history stores found on this machine to
-inventory. They keep conservative discovery paths and return [] when absent;
-do not fabricate formats for them without first finding real files.
+`windsurf`: no local history stores found on this machine to inventory.
+These adapters declare `PARSES_LIVE_SESSIONS = False` on the adapter class
+(see `agents/base.py`): they scan conservative discovery paths, return []
+when absent, create nothing on init, and `python main.py agents` reports
+them as lacking an evidenced session format. Do not fabricate formats for
+them without first finding real files — promote one by inventorying its
+real store (as done for Claude Code and Codex CLI above), implementing the
+parser, and flipping the flag.

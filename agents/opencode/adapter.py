@@ -1,7 +1,11 @@
 """
 OpenMem — OpenCode Adapter.
 
-Session storage: ~/.opencode/sessions/
+No evidenced OpenCode session format yet (doc/session_formats.md): nothing
+writes ~/.opencode/sessions/ in real installs. PARSES_LIVE_SESSIONS is
+False until a real format is inventoried.
+
+Session storage: ~/.opencode/sessions/ (unverified)
 Skill install: ~/.opencode/skills/
 Context injection: .opencode/context.md
 """
@@ -19,12 +23,13 @@ class OpenCodeAdapter(AgentAdapter):
 
     AGENT_NAME = "OpenCode"
     SKILL_FILES = ["SKILL.md", "learner.py"]
+    # Format unevidenced — see module docstring / doc/session_formats.md.
+    PARSES_LIVE_SESSIONS = False
 
     def __init__(self):
         self._workspace = os.getcwd()
         self._opencode_dir = os.path.join(os.path.expanduser("~"), ".opencode")
         self._session_dir = os.path.join(self._opencode_dir, "sessions")
-        os.makedirs(self._session_dir, exist_ok=True)
         self._message_hook = None
 
     def get_session_messages(self, limit: int = 100) -> List[Dict[str, str]]:

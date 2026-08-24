@@ -10,10 +10,13 @@ This ensures OpenMem works identically regardless of which AI agent is driving.
 import os
 import json
 import shutil
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class AgentAdapter(ABC):
@@ -37,6 +40,13 @@ class AgentAdapter(ABC):
     # Override in subclass
     AGENT_NAME: str = "unknown"
     SKILL_FILES = ["SKILL.md", "learner.py"]  # Files to copy for skill install
+
+    # False marks adapters whose session format is NOT yet evidenced
+    # against a real tool install (see doc/session_formats.md): they scan
+    # directories that no live tool writes, so CLI/status surfaces must
+    # report them as lacking a session parser instead of silently indexing
+    # zero messages forever.
+    PARSES_LIVE_SESSIONS = True
 
     # ------------------------------------------------------------------
     # Required: Every agent must implement these
@@ -194,7 +204,7 @@ class AgentAdapter(ABC):
         """
         install_path = self.get_skill_install_path()
         if not install_path:
-            print(f"[{self.AGENT_NAME}] Cannot determine skill install path")
+            logger.warning("[%s] Cannot determine skill install path", self.AGENT_NAME)
             return None
 
         if openmem_root is None:
@@ -202,7 +212,7 @@ class AgentAdapter(ABC):
 
         agent_skill_dir = os.path.join(openmem_root, "agents", self.AGENT_NAME.lower().replace(" ", "_"), "skill")
         if not os.path.exists(agent_skill_dir):
-            print(f"[{self.AGENT_NAME}] No skill found at {agent_skill_dir}")
+            logger.warning("[%s] No skill found at %s", self.AGENT_NAME, agent_skill_dir)
             return None
 
         try:
@@ -213,10 +223,10 @@ class AgentAdapter(ABC):
                 if os.path.exists(src):
                     shutil.copy2(src, dst)
 
-            print(f"[{self.AGENT_NAME}] Skills installed to {install_path}")
+            logger.info("[%s] Skills installed to %s", self.AGENT_NAME, install_path)
             return install_path
         except Exception as e:
-            print(f"[{self.AGENT_NAME}] Skill install failed: {e}")
+            logger.warning("[%s] Skill install failed: %s", self.AGENT_NAME, e)
             return None
 
     # ------------------------------------------------------------------
@@ -362,7 +372,7 @@ class AgentAdapter(ABC):
                     if isinstance(obj, dict):
                         records.append(obj)
         except (OSError, UnicodeDecodeError) as e:
-            print(f"[OpenMem] Cannot read session file {filepath}: {e}")
+            logger.warning("[OpenMem] Cannot read session file %s: %s", filepath, e)
         return records, malformed
 
     @staticmethod
@@ -467,8 +477,8 @@ def auto_detect_adapter() -> AgentAdapter:
         except Exception:
             continue
         if sessions:
-            print(f"[OpenMem] Auto-detected agent '{agent_name}' "
-                  f"from on-disk session history")
+            logger.info("[OpenMem] Auto-detected agent '%s' from on-disk session history",
+                        agent_name)
             return adapter
 
     # Fallback: return generic adapter
@@ -497,7 +507,7 @@ def resolve_agent_adapter(preferred: Optional[str] = None) -> AgentAdapter:
         adapter = get_adapter(preferred)
         if adapter:
             return adapter
-        print(f"[OpenMem] Unknown agent '{preferred}', falling back to detection")
+        logger.warning("[OpenMem] Unknown agent '%s', falling back to detection", preferred)
 
     env_agent = os.environ.get("OPENMEM_AGENT")
     if env_agent:

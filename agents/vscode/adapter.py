@@ -1,7 +1,12 @@
 """
 OpenMem — VS Code Adapter.
 
-Session storage: VS Code extension storage (~/.vscode/extensions/openmem-*/sessions/)
+No evidenced VS Code session format yet (doc/session_formats.md): the
+directory below is an OpenMem convention, not something live VS Code
+installs write. PARSES_LIVE_SESSIONS is False until a real format is
+inventoried.
+
+Session storage: ~/.vscode/openmem-sessions/ (OpenMem convention only)
 Skill install: VS Code extension or workspace .vscode/
 Context injection: .vscode/memory.md (referenced by Copilot/custom extension)
 """
@@ -19,12 +24,13 @@ class VscodeAdapter(AgentAdapter):
 
     AGENT_NAME = "VS Code"
     SKILL_FILES = ["SKILL.md", "learner.py"]
+    # Format unevidenced — see module docstring / doc/session_formats.md.
+    PARSES_LIVE_SESSIONS = False
 
     def __init__(self):
         self._workspace = os.environ.get("VSCODE_CWD", os.getcwd())
         self._vscode_dir = os.path.join(os.path.expanduser("~"), ".vscode")
         self._session_dir = os.path.join(self._vscode_dir, "openmem-sessions")
-        os.makedirs(self._session_dir, exist_ok=True)
         self._message_hook = None
 
     def get_session_messages(self, limit: int = 100) -> List[Dict[str, str]]:

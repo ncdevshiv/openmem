@@ -355,6 +355,23 @@ class TestNoKeyEnvironment(LLMBoundaryTestCase):
         self.assertEqual(calls, [])
         self.assertEqual(llm.provider, "heuristic")
 
+    def test_profile_user_returns_heuristic_schema_without_keys(self):
+        _, calls = _install_fake_litellm(canned_content=VALID_REFLECTION_JSON)
+        self.addCleanup(sys.modules.pop, "litellm", None)
+
+        from core.llm import OpenMemLLM
+        llm = OpenMemLLM()
+        profile = llm.profile_user(SESSION_MESSAGES)
+
+        self.assertEqual(calls, [], "heuristic profile must never hit the wire")
+        for key in ("formality", "verbosity", "emoji_usage",
+                    "preferred_response", "topics_of_interest",
+                    "communication_tips"):
+            self.assertIn(key, profile)
+        # Topics stay empty: user_model runs its own extractor in
+        # heuristic mode and would double-count raw word frequencies.
+        self.assertEqual(profile["topics_of_interest"], [])
+
     def test_reflect_runs_heuristic_without_any_completion_call(self):
         _, calls = _install_fake_litellm(canned_content=VALID_REFLECTION_JSON)
         self.addCleanup(sys.modules.pop, "litellm", None)

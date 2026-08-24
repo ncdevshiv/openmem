@@ -20,6 +20,7 @@ import tempfile
 import unittest
 import contextlib
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -27,6 +28,11 @@ from agents.base import AgentAdapter
 from agents.claude_code.adapter import ClaudeCodeAdapter
 from agents.codex_cli.adapter import CodexCliAdapter
 from agents.cursor.adapter import CursorAdapter
+from agents.vscode.adapter import VscodeAdapter
+from agents.windsurf.adapter import WindsurfAdapter
+from agents.opencode.adapter import OpenCodeAdapter
+from agents.kilo_cli.adapter import KiloCliAdapter
+from agents.antigravity_ide.adapter import AntigravityIdeAdapter
 
 
 def _write_jsonl(path: Path, records) -> str:
@@ -232,12 +238,12 @@ class TestClaudeCodeParser(unittest.TestCase):
         self.assertEqual(first_user["timestamp"], "2026-08-21T15:02:24.681Z")
 
     def test_tolerates_malformed_lines_with_debug_count(self):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        # Parse summaries go through logging, not stdout (MCP stdio safety).
+        with self.assertLogs("agents.claude_code.adapter", level="INFO") as logs:
             messages = self.adapter.get_session_messages(limit=100)
-        output = buf.getvalue()
+        joined = "\n".join(logs.output)
         self.assertEqual(len(messages), 5)  # 4 from A + 2 from B - nothing lost? checked below
-        self.assertIn("skipped 1 malformed line(s)", output)
+        self.assertIn("skipped 1 malformed line(s)", joined)
 
     def test_hours_back_window_excludes_old_files(self):
         # Session B was utime'd 2h back; push it beyond the 1h window
@@ -344,10 +350,10 @@ class TestCodexCliParser(unittest.TestCase):
             self.assertTrue(m["timestamp"].startswith("2026-08-21T14:55"))
 
     def test_tolerates_malformed_lines_with_debug_count(self):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        # Parse summaries go through logging, not stdout (MCP stdio safety).
+        with self.assertLogs("agents.codex_cli.adapter", level="INFO") as logs:
             self.adapter.get_session_messages(limit=100)
-        self.assertIn("skipped 1 malformed line(s)", buf.getvalue())
+        self.assertIn("skipped 1 malformed line(s)", "\n".join(logs.output))
 
 
 class TestCursorParser(unittest.TestCase):
@@ -495,6 +501,47 @@ class TestAdapterDrivenIndexer(unittest.TestCase):
         indexer2 = self._make_indexer()
         report = indexer2.run_indexing(hours_back=24)
         self.assertEqual(report["messages_indexed"], 0)
+
+
+class TestUnevidencedAdapterHonesty(unittest.TestCase):
+    """Skeleton adapters must not claim session parsing they cannot do.
+
+    These five scan directories that no real tool install writes (they are
+    OpenMem conventions, inventoried as unevidenced in
+    doc/session_formats.md). They must declare PARSES_LIVE_SESSIONS=False
+    and create nothing on disk at init.
+    """
+
+    UNEVIDENCED = [
+        ("vscode", VscodeAdapter),
+        ("windsurf", WindsurfAdapter),
+        ("opencode", OpenCodeAdapter),
+        ("kilo_cli", KiloCliAdapter),
+        ("antigravity_ide", AntigravityIdeAdapter),
+    ]
+
+    def test_unevidenced_adapters_declare_no_live_parsing(self):
+        for name, cls in self.UNEVIDENCED:
+            with self.subTest(agent=name):
+                self.assertFalse(
+                    getattr(cls, "PARSES_LIVE_SESSIONS", True),
+                    f"{name} must declare PARSES_LIVE_SESSIONS=False")
+
+    def test_evidenced_adapters_keep_live_parsing(self):
+        self.assertTrue(getattr(ClaudeCodeAdapter, "PARSES_LIVE_SESSIONS", True))
+        self.assertTrue(getattr(CodexCliAdapter, "PARSES_LIVE_SESSIONS", True))
+
+    def test_init_creates_no_home_directories(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+
+        for name, cls in self.UNEVIDENCED:
+            with self.subTest(agent=name):
+                with mock.patch("os.path.expanduser", return_value=home), \
+                     mock.patch("os.getcwd", return_value=home):
+                    cls()
+                self.assertEqual(os.listdir(home), [],
+                                 f"{name} init must not create ~/. dirs")
 
 
 if __name__ == "__main__":

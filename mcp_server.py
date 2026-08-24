@@ -83,6 +83,20 @@ def get_user_model():
     return _user_model
 
 
+def _record_usage(results, query: str, source: str) -> None:
+    """
+    Best-effort recall-usage recording over returned memories. This is the
+    producer side of the fitness signal for pruning/evolution; a tracking
+    failure must never fail the tool that produced the results.
+    """
+    try:
+        from memory_store.usage_tracker import get_usage_tracker
+        ids = [r.get("id") for r in results if r.get("id")]
+        get_usage_tracker().record_events(ids, query=query, source=source)
+    except Exception as e:
+        logger.warning("[OpenMem] usage tracking skipped: %s", e)
+
+
 @asynccontextmanager
 async def _stdout_guard(server):
     """
@@ -148,6 +162,7 @@ def build_server():
         results = get_store().search(query, n_results=max(1, int(limit)))
         if not results:
             return "No results."
+        _record_usage(results, query, "mcp.recall")
         lines = []
         for i, r in enumerate(results, 1):
             score = r.get("score")
@@ -172,6 +187,8 @@ def build_server():
         if not query:
             return ""
         results = get_store().search(query, n_results=max(1, int(limit)))
+        if results:
+            _record_usage(results, query, "mcp.context")
         # Same shape as AgentAdapter.format_memory_context (agents/base.py)
         lines = ["## Relevant Memory Context\n"]
         for i, mem in enumerate(results, 1):
@@ -209,6 +226,12 @@ def build_server():
             "tables": store_stats.get("tables"),
             "embedder_available": store_stats.get("embedder_available"),
         }
+        try:
+            from memory_store.usage_tracker import get_usage_tracker
+            payload["total_recall_events"] = get_usage_tracker().total_events()
+        except Exception as e:
+            logger.warning("[OpenMem] usage stats skipped: %s", e)
+            payload["total_recall_events"] = None
         return json.dumps(payload, indent=2)
 
     @server.tool(description="Delete a memory by id. Returns True on success.")
@@ -216,7 +239,14 @@ def build_server():
         memory_id = (memory_id or "").strip()
         if not memory_id:
             return False
-        return bool(get_store().delete_memory(memory_id))
+        deleted = bool(get_store().delete_memory(memory_id))
+        if deleted:
+            try:
+                from memory_store.usage_tracker import get_usage_tracker
+                get_usage_tracker().forget_memory(memory_id)
+            except Exception as e:
+                logger.warning("[OpenMem] usage purge skipped: %s", e)
+        return deleted
 
     return server
 
