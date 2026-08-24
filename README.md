@@ -123,10 +123,12 @@ mode, no reranker):
 | aggregate  | 16      | 0.740    | 0.708 | 0.719  | 0.237     |
 
 Thresholds and rationale live in [`eval/BASELINE.md`](eval/BASELINE.md); the
-gate fails CI if retrieval regresses below them. Known weaknesses of the
-current keyword matcher (substring false positives like *port* ⊂ *report* /
-*passport*, frequency-rewarding tie-breaks) are logged there as the exact
-targets for the future reranker/embedder work.
+gate fails CI if retrieval regresses below them. The embedder-free path is
+powered by a vendored ENR lexical layer (`memory_store/enr_lexical.py`):
+Porter-stemmed BM25 with a coord factor, positional phrase matching for quoted
+spans, cached inverted index, and per-result `score_details` explanations.
+Remaining known limits (polysemy across domains, vector-mode negative
+silence) are logged there as the exact targets for future semantic work.
 
 ## Architecture
 
