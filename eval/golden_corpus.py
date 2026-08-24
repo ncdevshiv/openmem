@@ -206,6 +206,12 @@ def build_golden_corpus(db_path: str) -> VectorDB:
     """
     db = VectorDB(db_path=db_path)
     specs = golden_corpus_specs()
+    # Embed fixtures exactly when the store would serve vector search:
+    # with no embedder the rows keep NULL vectors (offline-safe, keyword
+    # fallback reads raw text); with one loaded, NULL vectors would make
+    # every vector query miss -- measuring nothing while claiming
+    # "vector" mode.
+    auto_embed = getattr(db, "_local_embedder", None) is not None
     inserted_ids = []
     for spec in specs:
         mid = db.add_memory(
@@ -214,7 +220,7 @@ def build_golden_corpus(db_path: str) -> VectorDB:
             importance=spec["importance"],
             tags=spec["tags"],
             metadata=spec["metadata"],
-            auto_embed=False,  # offline-safe; vectors are NULL in keyword mode
+            auto_embed=auto_embed,
             memory_id=spec["id"],
         )
         if mid != spec["id"]:
