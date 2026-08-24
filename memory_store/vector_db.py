@@ -19,6 +19,8 @@ import sys
 import json
 import uuid
 import hashlib
+import math
+import re
 import logging
 import traceback
 import numpy as np
@@ -29,6 +31,10 @@ from dataclasses import dataclass, field
 
 # Module logger
 logger = logging.getLogger("openmem.vector_db")
+
+# ENR lexical layer (vendored, MIT — see enr_lexical.py header): Porter-stemmed
+# BM25 + positional phrase matching for the embedder-free search path.
+from .enr_lexical import EnrLexicalIndex, tokens_for_index
 
 try:
     import lancedb
@@ -218,6 +224,9 @@ class LanceDBVectorStore:
         self._db = None
         self._table = None
         self._local_embedder = None
+        # Cached ENR lexical index over table rows (embedder-free path);
+        # invalidated by every mutating operation, built lazily on first search.
+        self._lex_cache = None
         # Reranker settings
         self._reranker = None
         self._reranker_model_name = None
@@ -256,7 +265,9 @@ class LanceDBVectorStore:
                 with open(config_path, "r") as f:
                     config = json.load(f)
                 model = config.get("memory", {}).get("reranker_model")
-                if model:
+                # "auto"/empty are selection directives, not HF repo ids --
+                # passing them to CrossEncoder 401s against huggingface.co.
+                if model and str(model).lower() != "auto":
                     return model
             except (json.JSONDecodeError, OSError):
                 pass
@@ -665,6 +676,7 @@ class LanceDBVectorStore:
 
         try:
             self._table.add([record])
+            self._invalidate_lexical()
             return memory_id
         except Exception as e:
             logger.error(f"[LanceDB] Failed to add memory: {e}", exc_info=True)
@@ -716,6 +728,7 @@ class LanceDBVectorStore:
 
         try:
             self._table.add(records)
+            self._invalidate_lexical()
             return [r["id"] for r in records]
         except Exception as e:
             logger.error(f"[LanceDB] Batch add failed: {e}", exc_info=True)
@@ -749,8 +762,8 @@ class LanceDBVectorStore:
         if self._table is None:
             return []
 
-        # Graceful degradation: with no embedder, fall back to case-insensitive
-        # substring matching over content (honours the "raw text matching"
+        # Graceful degradation: with no embedder, fall back to embedder-free
+        # keyword matching (honours the "raw text matching"
         # notice logged by _init_embedder) instead of failing every query.
         if self._local_embedder is None:
             return self._keyword_search(
@@ -809,11 +822,69 @@ class LanceDBVectorStore:
                 # Fallback: return vector search results without reranking
                 results = filtered[:n_results]
 
-            return results
+            return [self._attach_vector_score(r) for r in results]
 
         except Exception as e:
             logger.error(f"[LanceDB] Search failed: {e}", exc_info=True)
             return []
+
+    @staticmethod
+    def _attach_vector_score(row: Dict) -> Dict:
+        """
+        Ensure vector-path results carry a "score" like keyword results do.
+
+        Uses cosine similarity derived from LanceDB's L2 _distance
+        (unit-norm embeddings: cos = 1 - d^2/2), clamped to [0,1]. The
+        reranker's raw logits stay under their own "rerank_score" key;
+        ranking order is never recomputed here.
+        """
+        if row.get("score") is None:
+            d = row.get("_distance")
+            if isinstance(d, (int, float)):
+                row["score"] = round(max(0.0, min(1.0, 1.0 - (d * d) / 2.0)), 6)
+        return row
+
+    # Compiled word-boundary matchers per query term, shared across calls
+    # (see _keyword_search). Values are re.Pattern or None for terms that
+    # must degrade to substring matching (non-alphanumeric code symbols).
+    _TERM_PATTERNS: Dict[str, Any] = {}
+
+    def _invalidate_lexical(self) -> None:
+        """Drop the cached ENR lexical index (called by every mutator)."""
+        self._lex_cache = None
+
+    def _lex_state(self) -> Dict[str, Any]:
+        """Lazily build the ENR lexical index over the current table rows."""
+        if self._lex_cache is not None:
+            return self._lex_cache
+        arrow = self._table.to_arrow()
+        rows = arrow.to_pylist()
+        index = EnrLexicalIndex()
+        for i, r in enumerate(rows):
+            index.add_unit(i, r.get("content") or "")
+        index.finalize()
+        self._lex_cache = {"index": index, "rows": rows}
+        return self._lex_cache
+
+    @classmethod
+    def _term_matcher(cls, term: str) -> Optional["re.Pattern"]:
+        """Return a compiled boundary matcher for term, or None.
+
+        Word-boundary anchored with light suffix expansion so a query term
+        still matches its inflected forms ("port" → "ported", "harness" →
+        "harnesses") while refusing embedded coincidences ("port" ⊄
+        "report", "passport"). Non-alphanumeric terms get no boundary
+        semantics from \\b and fall back to plain substring matching.
+        """
+        compiled = cls._TERM_PATTERNS.get(term)
+        if compiled is None and term not in cls._TERM_PATTERNS:
+            if term.isalnum():
+                compiled = re.compile(
+                    rf"\b{re.escape(term)}(?:es|s|ed|ing|ly)?\b",
+                    re.IGNORECASE,
+                )
+            cls._TERM_PATTERNS[term] = compiled
+        return compiled
 
     def _keyword_search(
         self,
@@ -825,14 +896,24 @@ class LanceDBVectorStore:
         filter_fn: Optional[callable],
     ) -> List[Dict]:
         """
-        Embedder-free fallback search: case-insensitive per-term substring
-        matching with naive relevance ranking (results are ordered by how
-        many distinct query terms they contain, then by total term
-        frequency). Each result carries a "score" field: the fraction of
-        query terms matched.
+        Embedder-free fallback search — ENR BM25 + phrase matching (D24-up).
+
+        Matching and ranking run over a cached positional inverted index
+        (`memory_store/enr_lexical.py`, vendored from ENR): full Porter
+        stemming on both index and query side, BM25 scoring (term-frequency
+        saturation + document-length normalization), and positional
+        exact-phrase detection for quoted spans. This replaces the previous
+        five-suffix boundary regex whose residual gaps (frequency-rewarding
+        ties, limited morphology) were logged in eval/BASELINE.md.
+
+        Score = BM25 normalized to the query's best hit; when the query
+        contains quoted phrases, score = 0.7 * bm25_norm + 0.3 * phrase
+        coverage. Ties break by stored importance, then insertion order.
+        Every result carries `score_details` (matched query words, raw BM25,
+        phrase hits) so ranking is explainable instead of a bare number.
 
         Args:
-            query: Search query text (whitespace-split into terms)
+            query: Search query text (quoted spans become phrase constraints)
             n_results: Max number of results
             session_id: Filter by session
             min_importance: Filter by minimum importance
@@ -840,50 +921,74 @@ class LanceDBVectorStore:
             filter_fn: Custom filter function (takes row dict, returns bool)
 
         Returns:
-            List of matching memory dicts ranked by naive relevance
+            List of matching memory dicts ranked by BM25 relevance
         """
         try:
-            terms = [t.strip() for t in query.split() if t.strip()]
-            if not terms:
+            state = self._lex_state()
+            rows = state["rows"]
+            if not rows:
                 return []
+            index: EnrLexicalIndex = state["index"]
 
-            arrow = self._table.to_arrow()
-            combined = None
-            for term in terms:
-                mask = pc.match_substring(arrow["content"], term, ignore_case=True)
-                combined = mask if combined is None else pc.or_(combined, mask)
-            if session_id:
-                combined = pc.and_(combined, pc.equal(arrow["session_id"], session_id))
-            if min_importance > 0:
-                combined = pc.and_(
-                    combined, pc.greater_equal(arrow["importance"], float(min_importance))
-                )
-            rows = arrow.filter(combined).to_pylist()
-
-            lowered_terms = [t.lower() for t in terms]
-
-            def _rank(row: Dict):
-                text = row.get("content", "").lower()
-                hits = sum(1 for t in lowered_terms if t in text)
-                freq = sum(text.count(t) for t in lowered_terms)
-                # Score: fraction of distinct terms matched, tie-broken by
-                # total occurrences so denser matches rank first.
-                row["score"] = hits / len(lowered_terms) if lowered_terms else 0.0
-                return (hits, freq)
+            phrases = re.findall(r'"([^"]{2,80})"', query or "")
+            phrase_hit_sets = [index.phrase_units(p) for p in phrases]
+            # coord denominator: distinct stemmed query terms (stopwords
+            # already dropped by the tokenizer).
+            q_terms = list(dict.fromkeys(tokens_for_index(query)))
+            scores = index.bm25(query)
+            max_s = float(scores.max()) if len(scores) else 0.0
 
             filtered = []
-            for r in rows:
-                if tags and not any(t in r.get("tags", []) for t in tags):
+            for uidx, r in enumerate(rows):
+                if session_id and r.get("session_id") != session_id:
+                    continue
+                if min_importance > 0 and \
+                        float(r.get("importance") or 0.0) < float(min_importance):
+                    continue
+                if tags and not any(t in (r.get("tags") or []) for t in tags):
                     continue
                 if filter_fn and not filter_fn(r):
                     continue
-                r["metadata"] = json.loads(r.get("metadata") or "{}")
-                filtered.append(r)
 
-            filtered.sort(key=_rank, reverse=True)
-            return filtered[:n_results]
+                base = float(scores[uidx]) / max_s if max_s > 0 else 0.0
+                phrase_hits = sum(1 for ps in phrase_hit_sets if uidx in ps)
+                # coord factor (classic Lucene): a unit matching MORE of the
+                # query's distinct terms outranks an equal-BM25 unit matching
+                # fewer — pure BM25 alone lets one rare term in a short doc
+                # crowd out broad-coverage evidence.
+                coverage = (len(index.matched_terms(query, uidx))
+                            / len(q_terms)) if q_terms else 1.0
+                base *= (0.25 + 0.75 * coverage)
+                if phrases:
+                    cov_p = phrase_hits / len(phrases)
+                    score = 0.7 * base + 0.3 * cov_p
+                else:
+                    score = base
+                if score <= 0:
+                    continue
+
+                try:
+                    importance = float(r.get("importance") or 0.0)
+                except (TypeError, ValueError):
+                    importance = 0.0
+
+                out_row = dict(r)
+                out_row["metadata"] = json.loads(out_row.get("metadata") or "{}")
+                out_row["score"] = round(min(1.0, score), 6)
+                out_row["score_details"] = {
+                    "matched_terms": index.matched_terms(query, uidx)[:8],
+                    "bm25_raw": round(float(scores[uidx]), 4),
+                    "term_coverage": round(coverage, 3),
+                    "phrase_hits": phrase_hits,
+                }
+                filtered.append((score, importance, uidx, out_row))
+
+            # deterministic order: score desc, then importance desc, then
+            # insertion order (stable).
+            filtered.sort(key=lambda t: (-t[0], -t[1], t[2]))
+            return [t[3] for t in filtered[:n_results]]
         except Exception as e:
-            logger.error(f"[LanceDB] Raw-text search failed: {e}", exc_info=True)
+            logger.error(f"[LanceDB] Keyword search failed: {e}", exc_info=True)
             return []
 
     def get_memory(self, memory_id: str) -> Optional[Dict]:
@@ -1032,6 +1137,7 @@ class LanceDBVectorStore:
                 row.update(changed)
                 self._table.delete(f"id = {self._sql_quote(memory_id)}")
                 self._table.add([row])
+                self._invalidate_lexical()
                 return True
 
             result = self._table.update(
@@ -1042,6 +1148,7 @@ class LanceDBVectorStore:
             if not updated:
                 logger.warning(f"[LanceDB] Update matched no rows for memory {memory_id}")
                 return False
+            self._invalidate_lexical()
             return True
         except Exception as e:
             logger.error(f"[LanceDB] Update failed for memory {memory_id}: {e}", exc_info=True)
@@ -1070,6 +1177,7 @@ class LanceDBVectorStore:
                 return False
 
             self._table.delete(f"id = {self._sql_quote(memory_id)}")
+            self._invalidate_lexical()
             return True
         except Exception as e:
             logger.error(f"[LanceDB] Delete failed for memory {memory_id}: {e}", exc_info=True)
@@ -1113,6 +1221,7 @@ class LanceDBVectorStore:
                 f"AND importance < {float(min_importance)}"
             )
             self._table.delete(where)
+            self._invalidate_lexical()
             return count
         except Exception as e:
             logger.error(f"[LanceDB] Delete old failed: {e}", exc_info=True)
